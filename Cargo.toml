@@ -1,0 +1,11 @@
+[package]
+name = "vector-beam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+glam = "0.33.0"
+pollster = "0.4.0"
+wgpu = "29.0.3"
+winit = "0.30.13"
