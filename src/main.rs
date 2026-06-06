@@ -5,6 +5,7 @@
 //! swapchain). The only animated input is the MVP matrix, updated per frame.
 
 mod geometry;
+mod screenshot;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,18 +22,33 @@ use winit::window::{Window, WindowId};
 /// explicit padding is required.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct BeamUniforms {
-    mvp: [f32; 16],
-    resolution: [f32; 2],
-    base_width: f32,
-    brightness: f32,
+pub(crate) struct BeamUniforms {
+    pub mvp: [f32; 16],
+    pub resolution: [f32; 2],
+    pub base_width: f32,
+    pub brightness: f32,
 }
 
 /// Per-instance vertex attributes: three vec3s at offsets 0, 12, 24 (stride 36).
-const SEGMENT_ATTRS: [wgpu::VertexAttribute; 3] =
+pub(crate) const SEGMENT_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
 
-const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(crate) const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Model-view-projection for the demo scene at a given time: a cube viewed from
+/// +Z, tumbling around two axes. Shared by the live window and the headless
+/// screenshot so both frame the scene identically.
+pub(crate) fn beam_mvp(aspect: f32, time: f32) -> glam::Mat4 {
+    let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
+    let view = glam::Mat4::look_at_rh(
+        glam::Vec3::new(0.0, 0.0, 3.0),
+        glam::Vec3::ZERO,
+        glam::Vec3::Y,
+    );
+    let model =
+        glam::Mat4::from_rotation_y(time * 0.7) * glam::Mat4::from_rotation_x(time * 0.4);
+    proj * view * model
+}
 
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -302,15 +318,7 @@ impl GpuState {
     fn render(&mut self, time: f32) {
         // Animate: spin the cube around two axes, look at it from +Z.
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
-        let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(0.0, 0.0, 3.0),
-            glam::Vec3::ZERO,
-            glam::Vec3::Y,
-        );
-        let model = glam::Mat4::from_rotation_y(time * 0.7)
-            * glam::Mat4::from_rotation_x(time * 0.4);
-        let mvp = proj * view * model;
+        let mvp = beam_mvp(aspect, time);
 
         let uniforms = BeamUniforms {
             mvp: mvp.to_cols_array(),
@@ -487,6 +495,26 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    // Headless mode: `vector-beam --screenshot [path] [WxH]` renders one frame to
+    // a PNG and exits, with no window. Everything else opens the live window.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
+        let path = args
+            .get(pos + 1)
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "docs/screenshot.png".to_string());
+        let (width, height) = args
+            .get(pos + 2)
+            .and_then(|s| s.split_once('x'))
+            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            .unwrap_or((1280, 960));
+        // A few seconds in, the cube sits at a pleasant three-quarter angle.
+        screenshot::capture(&path, width, height, 2.6);
+        println!("wrote {path} ({width}x{height})");
+        return;
+    }
+
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();

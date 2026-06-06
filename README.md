@@ -5,9 +5,7 @@ A tiny **vector-display / "electron beam" line renderer** in [wgpu](https://wgpu
 beam cross-section into an HDR target, so they glow like phosphor strokes on an
 old oscilloscope or vector arcade monitor.
 
-![screenshot placeholder](docs/screenshot.png)
-
-> Drop a capture into `docs/screenshot.png` to fill the image above.
+![A glowing wireframe cube rendered as vector-display beams](docs/screenshot.png)
 
 ## Run it
 
@@ -17,6 +15,15 @@ cargo run --release
 
 A window opens showing a slowly tumbling wireframe cube drawn as glowing beams.
 Needs a GPU with a Vulkan / Metal / DX12 / GL backend (anything wgpu supports).
+
+### Regenerate the screenshot
+
+The same renderer can capture a single frame to a PNG headlessly (no window),
+which is how `docs/screenshot.png` is produced:
+
+```sh
+cargo run --release -- --screenshot docs/screenshot.png 1280x960
+```
 
 ## How it works
 
