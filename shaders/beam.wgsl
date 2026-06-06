@@ -36,14 +36,36 @@ fn vs_main(
     let end = ends[vid];
     let side = sides[vid];
 
-    let clip0 = u.mvp * vec4<f32>(p0, 1.0);
-    let clip1 = u.mvp * vec4<f32>(p1, 1.0);
+    var c0 = u.mvp * vec4<f32>(p0, 1.0);
+    var c1 = u.mvp * vec4<f32>(p1, 1.0);
+
+    // Near-plane clipping. The screen-space expansion below divides by w, which
+    // is meaningless for a point at or behind the camera plane (w <= 0). Clip the
+    // segment against w = near_w *before* the perspective divide so both
+    // endpoints sit safely in front of the camera; cull the whole primitive if
+    // neither does. Without this, a segment crossing the near plane explodes into
+    // garbage geometry.
+    let near_w = 1e-4;
+    if (c0.w <= near_w && c1.w <= near_w) {
+        var culled: VsOut;
+        culled.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); // outside the clip volume
+        culled.across = 0.0;
+        culled.along = 0.0;
+        culled.color = vec3<f32>(0.0);
+        culled.intensity = 0.0;
+        return culled;
+    }
+    if (c0.w <= near_w) {
+        c0 = mix(c0, c1, (near_w - c0.w) / (c1.w - c0.w));
+    } else if (c1.w <= near_w) {
+        c1 = mix(c1, c0, (near_w - c1.w) / (c0.w - c1.w));
+    }
 
     // Endpoints in pixel space (for a constant screen-space line width and the
     // beam-speed estimate).
     let half_res = u.resolution * 0.5;
-    let screen0 = (clip0.xy / clip0.w) * half_res;
-    let screen1 = (clip1.xy / clip1.w) * half_res;
+    let screen0 = (c0.xy / c0.w) * half_res;
+    let screen1 = (c1.xy / c1.w) * half_res;
 
     let seg = screen1 - screen0;
     let seg_len = max(length(seg), 1e-4);
@@ -51,14 +73,18 @@ fn vs_main(
     let normal = vec2<f32>(-dir.y, dir.x);
 
     // Beam-speed model: a longer screen segment is "drawn faster" in a fixed
-    // unit of beam time, so it is dimmer and thinner.
+    // unit of beam time, so it is dimmer and thinner. Intensity is divided by the
+    // width factor so a slower (thicker) beam spreads its energy across the wider
+    // line instead of also multiplying peak brightness -- without this, short or
+    // slow segments over-blow on the HDR target.
     let dwell = clamp(160.0 / (seg_len + 60.0), 0.4, 2.5);
-    let width = u.base_width * mix(0.7, 1.7, clamp(dwell - 0.3, 0.0, 1.0));
-    let intensity = u.brightness * dwell;
+    let width_scale = mix(0.7, 1.7, clamp(dwell - 0.3, 0.0, 1.0));
+    let width = u.base_width * width_scale;
+    let intensity = u.brightness * dwell / width_scale;
 
-    var clip = clip0;
+    var clip = c0;
     if (end > 0.5) {
-        clip = clip1;
+        clip = c1;
     }
 
     // Offset perpendicular by a constant pixel width (scaled by clip.w so the

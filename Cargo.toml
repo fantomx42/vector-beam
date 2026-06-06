@@ -2,6 +2,8 @@
 name = "vector-beam"
 version = "0.1.0"
 edition = "2024"
+license = "CC-BY-NC-4.0"
+description = "A vector-display / electron-beam line renderer in wgpu."
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }

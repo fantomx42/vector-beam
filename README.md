@@ -52,19 +52,19 @@ The host code in [`src/main.rs`](src/main.rs) is a minimal winit + wgpu setup;
 the swappable scene generators live in [`src/geometry.rs`](src/geometry.rs)
 (a wireframe cube by default, plus a Lissajous "oscilloscope" curve).
 
-## Known limitations
+## Implementation notes
 
-- **Near-plane clipping is not handled.** Segments with an endpoint behind the
-  camera (`clip.w <= 0`) produce garbage geometry, because the screen-space
-  expansion divides by `w` before measuring the segment. The default orbiting
-  camera never triggers it, but a free camera would. Tracked in
-  [#1](../../issues/1); the fix is to clip each segment against `w = ε` in clip
-  space *before* the perspective divide.
-- **Doubled dwell response.** The beam-speed model scales *both* width and
-  intensity with dwell, and the Gaussian profile isn't energy-normalized across
-  width, so very short segments can over-blow on an HDR target. A more
-  physically-plausible CRT would scale intensity roughly as `1/width`.
+- **Near-plane clipping is handled.** A segment with an endpoint at or behind the
+  camera plane (`w <= 0`) is clipped against `w = ε` *in clip space, before* the
+  perspective divide, by interpolating the crossing point; segments fully behind
+  the camera are culled. Without this, a segment crossing the near plane would
+  explode into garbage geometry. (Resolved [#1](../../issues/1).)
+- **Energy-normalized dwell.** The beam-speed model makes slow beams thicker, but
+  intensity is divided by the width factor so a thicker beam *spreads* its energy
+  across the wider line rather than also multiplying peak brightness — otherwise
+  short/slow segments over-blow on the HDR target (`intensity ∝ dwell / width`).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[CC BY-NC 4.0](LICENSE) (Creative Commons Attribution-NonCommercial 4.0
+International) — share and adapt with attribution, non-commercial use only.
