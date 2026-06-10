@@ -1,21 +1,23 @@
 //! Headless one-frame capture: render the beam scene into an offscreen sRGB
 //! texture (no window, no compositor), read it back, and write a PNG. Used by
 //! `vector-beam --screenshot`. Reuses the same shaders, geometry, and MVP as the
-//! live renderer so the docs image matches what the window shows.
+//! live renderer so the docs image matches what the window shows. Phosphor
+//! persistence has no visible effect in a single isolated frame, so the capture
+//! simulates the preceding frames at 60 Hz to build up real trails first.
 
 use wgpu::util::DeviceExt;
 
-use crate::{beam_mvp, geometry, BeamUniforms, HDR_FORMAT, SEGMENT_ATTRS};
+use crate::{beam_mvp, geometry, make_decay_pipeline, BeamUniforms, HDR_FORMAT, SEGMENT_ATTRS};
 
 /// The swapchain is sRGB at runtime; match that here so the read-back bytes are
 /// already sRGB-encoded and drop straight into a PNG.
 const OUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn capture(path: &str, width: u32, height: u32, time: f32) {
-    pollster::block_on(capture_async(path, width, height, time));
+pub fn capture(path: &str, width: u32, height: u32, time: f32, persistence: f32) {
+    pollster::block_on(capture_async(path, width, height, time, persistence));
 }
 
-async fn capture_async(path: &str, width: u32, height: u32, time: f32) {
+async fn capture_async(path: &str, width: u32, height: u32, time: f32, persistence: f32) {
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -46,8 +48,9 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32) {
         usage: wgpu::BufferUsages::VERTEX,
     });
 
-    let uniforms = BeamUniforms {
-        mvp: beam_mvp(width as f32 / height as f32, time).to_cols_array(),
+    // Rewritten once per simulated frame (the MVP advances), hence COPY_DST.
+    let uniforms_at = |t: f32| BeamUniforms {
+        mvp: beam_mvp(width as f32 / height as f32, t).to_cols_array(),
         resolution: [width as f32, height as f32],
         // Slightly wider than the interactive default so beams read well at the
         // higher still-image resolution.
@@ -56,8 +59,8 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32) {
     };
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("beam uniforms"),
-        contents: bytemuck::bytes_of(&uniforms),
-        usage: wgpu::BufferUsages::UNIFORM,
+        contents: bytemuck::bytes_of(&uniforms_at(time)),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     // --- Beam pipeline (-> HDR target, additive) ---
@@ -125,6 +128,9 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32) {
         multiview_mask: None,
         cache: None,
     });
+
+    // --- Decay pipeline (phosphor persistence: fades the HDR target) ---
+    let decay_pipeline = make_decay_pipeline(&device);
 
     // --- Tonemap pipeline (HDR texture -> sRGB output) ---
     let tonemap_shader =
@@ -247,31 +253,66 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32) {
         mapped_at_creation: false,
     });
 
-    // --- Encode + submit ---
+    // --- Simulate frames into the persistent HDR target ---
+    // Persistence trails are history: replay the preceding ~5 time constants at
+    // 60 Hz (after which older strokes are <1% bright), ending on the capture
+    // time. With persistence off, a single frame over the zero-initialized HDR
+    // texture reproduces the old one-shot behavior. One submit per simulated
+    // frame so each queued uniform write lands before its passes run.
+    let dt = 1.0 / 60.0;
+    let steps = if persistence > 0.0 {
+        ((persistence * 5.0 / dt).ceil() as u32).max(1)
+    } else {
+        1
+    };
+    let decay = if persistence > 0.0 {
+        (-dt / persistence).exp() as f64
+    } else {
+        0.0
+    };
+    for i in 0..steps {
+        let t = time - (steps - 1 - i) as f32 * dt;
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms_at(t)));
+
+        let mut encoder = device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sim frame") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("decay+beam pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&decay_pipeline);
+            pass.set_blend_constant(wgpu::Color {
+                r: decay,
+                g: decay,
+                b: decay,
+                a: decay,
+            });
+            pass.draw(0..3, 0..1);
+
+            pass.set_pipeline(&beam_pipeline);
+            pass.set_bind_group(0, &beam_bind_group, &[]);
+            pass.set_vertex_buffer(0, instance_buffer.slice(..));
+            pass.draw(0..6, 0..instance_count);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    // --- Tonemap + read back ---
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture") });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("beam pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &hdr_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&beam_pipeline);
-        pass.set_bind_group(0, &beam_bind_group, &[]);
-        pass.set_vertex_buffer(0, instance_buffer.slice(..));
-        pass.draw(0..6, 0..instance_count);
-    }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("tonemap pass"),

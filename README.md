@@ -5,7 +5,7 @@ A tiny **vector-display / "electron beam" line renderer** in [wgpu](https://wgpu
 beam cross-section into an HDR target, so they glow like phosphor strokes on an
 old oscilloscope or vector arcade monitor.
 
-![A glowing wireframe cube rendered as vector-display beams](docs/screenshot.png)
+![A glowing wireframe cube rendered as vector-display beams, its edges smearing into fading phosphor trails](docs/screenshot.png)
 
 ## Run it
 
@@ -13,8 +13,12 @@ old oscilloscope or vector arcade monitor.
 cargo run --release
 ```
 
-A window opens showing a slowly tumbling wireframe cube drawn as glowing beams.
+A window opens showing a slowly tumbling wireframe cube drawn as glowing beams,
+leaving fading phosphor trails as it turns.
 Needs a GPU with a Vulkan / Metal / DX12 / GL backend (anything wgpu supports).
+
+The trail length is tunable with `--persistence <seconds>` (the phosphor decay
+time constant, default `0.1`); `--persistence 0` disables trails entirely.
 
 ### Regenerate the screenshot
 
@@ -47,6 +51,14 @@ The interesting part is the shader, [`shaders/beam.wgsl`](shaders/beam.wgsl).
   target with additive blending so overlapping strokes *accumulate* light, then
   a fullscreen [`shaders/tonemap.wgsl`](shaders/tonemap.wgsl) pass applies
   exposure + Reinhard tonemapping and resolves to the sRGB swapchain.
+- **Phosphor persistence.** The HDR target is never cleared; instead, each frame
+  starts by fading it with a fullscreen [`shaders/decay.wgsl`](shaders/decay.wgsl)
+  draw before the new beams are added on top, so strokes linger and fade like
+  excited phosphor. The fade needs no extra textures or shader reads — the
+  pipeline blends with `(src: Zero, dst: Constant)`, computing
+  `dst * blend_constant` in fixed-function hardware, and the host loads
+  `exp(-dt / persistence)` into the blend constant each frame so the decay is
+  framerate-independent.
 
 The host code in [`src/main.rs`](src/main.rs) is a minimal winit + wgpu setup;
 the swappable scene generators live in [`src/geometry.rs`](src/geometry.rs)
@@ -63,6 +75,10 @@ the swappable scene generators live in [`src/geometry.rs`](src/geometry.rs)
   intensity is divided by the width factor so a thicker beam *spreads* its energy
   across the wider line rather than also multiplying peak brightness — otherwise
   short/slow segments over-blow on the HDR target (`intensity ∝ dwell / width`).
+- **Screenshots replay history.** A persistence trail is, by definition, light
+  from *previous* frames, so a one-shot headless render would show none. The
+  screenshot path instead simulates the preceding ~5 time constants of frames at
+  60 Hz into the persistent HDR target and captures the last one.
 
 ## License
 

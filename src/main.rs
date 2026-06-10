@@ -1,8 +1,9 @@
 //! vector-beam: a native wgpu host that drives `shaders/beam.wgsl`.
 //!
-//! Pipeline: instanced line segments -> beam pass (additive blend into an
-//! Rgba16Float HDR target) -> tonemap pass (Reinhard, resolve to the sRGB
-//! swapchain). The only animated input is the MVP matrix, updated per frame.
+//! Pipeline: decay pass (fade the persistent HDR target -> phosphor trails) ->
+//! beam pass (instanced line segments, additive blend into the same Rgba16Float
+//! HDR target) -> tonemap pass (Reinhard, resolve to the sRGB swapchain). The
+//! only animated input is the MVP matrix, updated per frame.
 
 mod geometry;
 mod screenshot;
@@ -35,6 +36,54 @@ pub(crate) const SEGMENT_ATTRS: [wgpu::VertexAttribute; 3] =
 
 pub(crate) const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Default phosphor persistence time constant (seconds). The HDR target fades
+/// by `exp(-dt / persistence)` each frame, so strokes are ~5% bright after
+/// 3 time constants. 0 disables persistence (every frame starts black).
+pub(crate) const DEFAULT_PERSISTENCE: f32 = 0.1;
+
+/// Build the render pipeline for `shaders/decay.wgsl`: a fullscreen triangle
+/// whose only effect is the fixed-function blend `dst * blend_constant`, fading
+/// the persistent HDR target. Shared by the live window and the screenshot path.
+pub(crate) fn make_decay_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/decay.wgsl"));
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("decay pl layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    // result = src * 0 + dst * constant — the fragment output never matters.
+    let fade = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::Constant,
+        operation: wgpu::BlendOperation::Add,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("decay pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState { color: fade, alpha: fade }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// Model-view-projection for the demo scene at a given time: a cube viewed from
 /// +Z, tumbling around two axes. Shared by the live window and the headless
 /// screenshot so both frame the scene identically.
@@ -56,8 +105,14 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
+    decay_pipeline: wgpu::RenderPipeline,
     beam_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
+
+    // Phosphor persistence time constant (seconds); 0 disables. `last_frame`
+    // feeds the framerate-independent decay factor exp(-dt / persistence).
+    persistence: f32,
+    last_frame: Instant,
 
     uniform_buffer: wgpu::Buffer,
     beam_bind_group: wgpu::BindGroup,
@@ -74,7 +129,7 @@ struct GpuState {
 }
 
 impl GpuState {
-    async fn new(window: Arc<Window>) -> Self {
+    async fn new(window: Arc<Window>, persistence: f32) -> Self {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -214,6 +269,9 @@ impl GpuState {
             cache: None,
         });
 
+        // --- Decay pipeline (phosphor persistence: fades the HDR target) ---
+        let decay_pipeline = make_decay_pipeline(&device);
+
         // --- Tonemap pipeline (HDR texture -> swapchain) ---
         let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tonemap bgl"),
@@ -284,8 +342,11 @@ impl GpuState {
             device,
             queue,
             config,
+            decay_pipeline,
             beam_pipeline,
             tonemap_pipeline,
+            persistence,
+            last_frame: Instant::now(),
             uniform_buffer,
             beam_bind_group,
             instance_buffer,
@@ -316,6 +377,18 @@ impl GpuState {
     }
 
     fn render(&mut self, time: f32) {
+        // Framerate-independent phosphor fade for this frame. With persistence
+        // disabled the factor is 0, which multiplies the old frame away entirely
+        // (equivalent to the pre-persistence clear).
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        let decay = if self.persistence > 0.0 {
+            (-dt / self.persistence).exp() as f64
+        } else {
+            0.0
+        };
+
         // Animate: spin the cube around two axes, look at it from +Z.
         let aspect = self.config.width as f32 / self.config.height as f32;
         let mvp = beam_mvp(aspect, time);
@@ -347,16 +420,18 @@ impl GpuState {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
-        // Pass 1: beams -> HDR target (additive over black).
+        // Pass 1: fade last frame's light (phosphor persistence), then add this
+        // frame's beams on top — both into the persistent HDR target, which is
+        // loaded rather than cleared so trails survive across frames.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("beam pass"),
+                label: Some("decay+beam pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.hdr_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -365,6 +440,15 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_pipeline(&self.decay_pipeline);
+            pass.set_blend_constant(wgpu::Color {
+                r: decay,
+                g: decay,
+                b: decay,
+                a: decay,
+            });
+            pass.draw(0..3, 0..1);
+
             pass.set_pipeline(&self.beam_pipeline);
             pass.set_bind_group(0, &self.beam_bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
@@ -445,6 +529,7 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     start: Option<Instant>,
+    persistence: f32,
 }
 
 impl ApplicationHandler for App {
@@ -461,7 +546,7 @@ impl ApplicationHandler for App {
                 )
                 .expect("create window"),
         );
-        let gpu = pollster::block_on(GpuState::new(window.clone()));
+        let gpu = pollster::block_on(GpuState::new(window.clone(), self.persistence));
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.start = Some(Instant::now());
@@ -497,7 +582,16 @@ impl ApplicationHandler for App {
 fn main() {
     // Headless mode: `vector-beam --screenshot [path] [WxH]` renders one frame to
     // a PNG and exits, with no window. Everything else opens the live window.
+    // `--persistence <seconds>` sets the phosphor fade time constant in either
+    // mode (0 disables trails).
     let args: Vec<String> = std::env::args().collect();
+    let persistence = args
+        .iter()
+        .position(|a| a == "--persistence")
+        .and_then(|p| args.get(p + 1))
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(DEFAULT_PERSISTENCE)
+        .max(0.0);
     if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
         let path = args
             .get(pos + 1)
@@ -510,13 +604,16 @@ fn main() {
             .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             .unwrap_or((1280, 960));
         // A few seconds in, the cube sits at a pleasant three-quarter angle.
-        screenshot::capture(&path, width, height, 2.6);
+        screenshot::capture(&path, width, height, 2.6, persistence);
         println!("wrote {path} ({width}x{height})");
         return;
     }
 
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+    let mut app = App {
+        persistence,
+        ..App::default()
+    };
     event_loop.run_app(&mut app).expect("run app");
 }
