@@ -20,6 +20,20 @@ Needs a GPU with a Vulkan / Metal / DX12 / GL backend (anything wgpu supports).
 The trail length is tunable with `--persistence <seconds>` (the phosphor decay
 time constant, default `0.1`); `--persistence 0` disables trails entirely.
 
+### Scenes
+
+`--scene <name>` picks the demo scene:
+
+- `cube` (default) — the tumbling wireframe cube above.
+- `lissajous` — a dense 3D Lissajous curve whose phase drifts over time, so the
+  figure continuously morphs like a slowly de-tuning oscilloscope:
+
+```sh
+cargo run --release -- --scene lissajous
+```
+
+![A morphing 3D Lissajous curve drawn as a hot phosphor trace](docs/lissajous.png)
+
 ### Regenerate the screenshot
 
 The same renderer can capture a single frame to a PNG headlessly (no window),
@@ -61,8 +75,10 @@ The interesting part is the shader, [`shaders/beam.wgsl`](shaders/beam.wgsl).
   framerate-independent.
 
 The host code in [`src/main.rs`](src/main.rs) is a minimal winit + wgpu setup;
-the swappable scene generators live in [`src/geometry.rs`](src/geometry.rs)
-(a wireframe cube by default, plus a Lissajous "oscilloscope" curve).
+the scenes live in [`src/geometry.rs`](src/geometry.rs) behind a `Scene` enum.
+A scene owns its segments and its model matrix: the cube is rigid (all motion
+is in the matrix; its vertex buffer uploads once), while the Lissajous morphs,
+so its segments are regenerated and re-uploaded every frame.
 
 ## Implementation notes
 

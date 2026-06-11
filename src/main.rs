@@ -84,19 +84,17 @@ pub(crate) fn make_decay_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline
     })
 }
 
-/// Model-view-projection for the demo scene at a given time: a cube viewed from
-/// +Z, tumbling around two axes. Shared by the live window and the headless
-/// screenshot so both frame the scene identically.
-pub(crate) fn beam_mvp(aspect: f32, time: f32) -> glam::Mat4 {
+/// Model-view-projection for a scene at a given time, viewed from +Z (the
+/// scene supplies its own model motion). Shared by the live window and the
+/// headless screenshot so both frame the scene identically.
+pub(crate) fn beam_mvp(scene: geometry::Scene, aspect: f32, time: f32) -> glam::Mat4 {
     let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
     let view = glam::Mat4::look_at_rh(
         glam::Vec3::new(0.0, 0.0, 3.0),
         glam::Vec3::ZERO,
         glam::Vec3::Y,
     );
-    let model =
-        glam::Mat4::from_rotation_y(time * 0.7) * glam::Mat4::from_rotation_x(time * 0.4);
-    proj * view * model
+    proj * view * scene.model(time)
 }
 
 struct GpuState {
@@ -114,6 +112,8 @@ struct GpuState {
     persistence: f32,
     last_frame: Instant,
 
+    scene: geometry::Scene,
+
     uniform_buffer: wgpu::Buffer,
     beam_bind_group: wgpu::BindGroup,
 
@@ -129,7 +129,7 @@ struct GpuState {
 }
 
 impl GpuState {
-    async fn new(window: Arc<Window>, persistence: f32) -> Self {
+    async fn new(window: Arc<Window>, persistence: f32, scene: geometry::Scene) -> Self {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -182,12 +182,14 @@ impl GpuState {
         surface.configure(&device, &config);
 
         // --- Geometry ---
-        let segments = geometry::wireframe_cube(0.7);
+        // COPY_DST because animated scenes (Lissajous) rewrite the segments
+        // every frame; the segment count is fixed, so the buffer never grows.
+        let segments = scene.segments(0.0);
         let instance_count = segments.len() as u32;
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("segments"),
             contents: bytemuck::cast_slice(&segments),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         // --- Uniforms ---
@@ -347,6 +349,7 @@ impl GpuState {
             tonemap_pipeline,
             persistence,
             last_frame: Instant::now(),
+            scene,
             uniform_buffer,
             beam_bind_group,
             instance_buffer,
@@ -389,9 +392,15 @@ impl GpuState {
             0.0
         };
 
-        // Animate: spin the cube around two axes, look at it from +Z.
+        // Animate: the scene's model matrix always moves; a morphing scene
+        // (Lissajous) additionally regenerates its segments each frame.
+        if self.scene.animated() {
+            let segments = self.scene.segments(time);
+            self.queue
+                .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&segments));
+        }
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let mvp = beam_mvp(aspect, time);
+        let mvp = beam_mvp(self.scene, aspect, time);
 
         let uniforms = BeamUniforms {
             mvp: mvp.to_cols_array(),
@@ -530,6 +539,7 @@ struct App {
     gpu: Option<GpuState>,
     start: Option<Instant>,
     persistence: f32,
+    scene: geometry::Scene,
 }
 
 impl ApplicationHandler for App {
@@ -546,7 +556,8 @@ impl ApplicationHandler for App {
                 )
                 .expect("create window"),
         );
-        let gpu = pollster::block_on(GpuState::new(window.clone(), self.persistence));
+        let gpu =
+            pollster::block_on(GpuState::new(window.clone(), self.persistence, self.scene));
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.start = Some(Instant::now());
@@ -583,7 +594,7 @@ fn main() {
     // Headless mode: `vector-beam --screenshot [path] [WxH]` renders one frame to
     // a PNG and exits, with no window. Everything else opens the live window.
     // `--persistence <seconds>` sets the phosphor fade time constant in either
-    // mode (0 disables trails).
+    // mode (0 disables trails); `--scene cube|lissajous` picks the demo scene.
     let args: Vec<String> = std::env::args().collect();
     let persistence = args
         .iter()
@@ -592,6 +603,19 @@ fn main() {
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(DEFAULT_PERSISTENCE)
         .max(0.0);
+    let scene = match args.iter().position(|a| a == "--scene").map(|p| args.get(p + 1)) {
+        None => geometry::Scene::default(),
+        Some(name) => match name.and_then(|n| geometry::Scene::parse(n)) {
+            Some(scene) => scene,
+            None => {
+                eprintln!(
+                    "--scene expects one of: cube, lissajous (got {:?})",
+                    name.map(String::as_str).unwrap_or("nothing")
+                );
+                std::process::exit(2);
+            }
+        },
+    };
     if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
         let path = args
             .get(pos + 1)
@@ -604,7 +628,7 @@ fn main() {
             .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             .unwrap_or((1280, 960));
         // A few seconds in, the cube sits at a pleasant three-quarter angle.
-        screenshot::capture(&path, width, height, 2.6, persistence);
+        screenshot::capture(&path, width, height, 2.6, persistence, scene);
         println!("wrote {path} ({width}x{height})");
         return;
     }
@@ -613,6 +637,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         persistence,
+        scene,
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");

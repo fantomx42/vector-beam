@@ -7,6 +7,57 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Which demo scene to render, parsed from `--scene` on the command line.
+///
+/// A scene owns both its line segments and its model matrix. The cube is rigid
+/// — its segments never change and all motion lives in the model matrix. The
+/// Lissajous curve *morphs* (its phase drifts over time), so its segments are
+/// regenerated every frame and the host must upload them with
+/// `queue.write_buffer` instead of a one-time buffer init.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scene {
+    #[default]
+    Cube,
+    Lissajous,
+}
+
+impl Scene {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "cube" => Some(Scene::Cube),
+            "lissajous" => Some(Scene::Lissajous),
+            _ => None,
+        }
+    }
+
+    /// The scene's line segments at `time`. Both scenes emit a fixed segment
+    /// count, so the instance buffer never needs to grow.
+    pub fn segments(self, time: f32) -> Vec<Segment> {
+        match self {
+            Scene::Cube => wireframe_cube(0.7),
+            Scene::Lissajous => lissajous(600, time),
+        }
+    }
+
+    /// Whether `segments(time)` changes between frames (=> the instance buffer
+    /// must be rewritten per frame).
+    pub fn animated(self) -> bool {
+        matches!(self, Scene::Lissajous)
+    }
+
+    /// Model matrix at `time`: tumble the cube around two axes; turn the
+    /// Lissajous slowly around Y so its depth reads without overpowering the
+    /// curve's own morphing.
+    pub fn model(self, time: f32) -> glam::Mat4 {
+        match self {
+            Scene::Cube => {
+                glam::Mat4::from_rotation_y(time * 0.7) * glam::Mat4::from_rotation_x(time * 0.4)
+            }
+            Scene::Lissajous => glam::Mat4::from_rotation_y(time * 0.25),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Segment {
@@ -61,17 +112,19 @@ pub fn wireframe_cube(s: f32) -> Vec<Segment> {
 }
 
 /// A 3D Lissajous curve sampled into `n` connected segments — an "oscilloscope"
-/// scene. Not used by default; kept as a drop-in alternative for `main` to show
-/// the beam-speed model over a dense continuous stroke.
-#[allow(dead_code)]
-pub fn lissajous(n: usize) -> Vec<Segment> {
+/// scene (`--scene lissajous`) showing the beam-speed model over a dense
+/// continuous stroke. The X and Z phases drift with `time` so the figure
+/// continuously morphs; under phosphor persistence the morph is what leaves
+/// trails (and keeps any one pixel from accumulating to a hot static glow).
+pub fn lissajous(n: usize, time: f32) -> Vec<Segment> {
     use std::f32::consts::TAU;
     let color = [0.4, 1.0, 0.7];
+    let phase = 0.5 * time;
     let point = |t: f32| -> [f32; 3] {
         [
-            (3.0 * t).sin() * 0.8,
+            (3.0 * t + phase).sin() * 0.8,
             (2.0 * t + 0.5).sin() * 0.8,
-            (5.0 * t).cos() * 0.4,
+            (5.0 * t - 0.3 * phase).cos() * 0.4,
         ]
     };
     (0..n)

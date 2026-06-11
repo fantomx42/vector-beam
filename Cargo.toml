@@ -1,6 +1,6 @@
 [package]
 name = "vector-beam"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "CC-BY-NC-4.0"
 description = "A vector-display / electron-beam line renderer in wgpu."

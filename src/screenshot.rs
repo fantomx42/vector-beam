@@ -13,11 +13,25 @@ use crate::{beam_mvp, geometry, make_decay_pipeline, BeamUniforms, HDR_FORMAT, S
 /// already sRGB-encoded and drop straight into a PNG.
 const OUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn capture(path: &str, width: u32, height: u32, time: f32, persistence: f32) {
-    pollster::block_on(capture_async(path, width, height, time, persistence));
+pub fn capture(
+    path: &str,
+    width: u32,
+    height: u32,
+    time: f32,
+    persistence: f32,
+    scene: geometry::Scene,
+) {
+    pollster::block_on(capture_async(path, width, height, time, persistence, scene));
 }
 
-async fn capture_async(path: &str, width: u32, height: u32, time: f32, persistence: f32) {
+async fn capture_async(
+    path: &str,
+    width: u32,
+    height: u32,
+    time: f32,
+    persistence: f32,
+    scene: geometry::Scene,
+) {
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -40,17 +54,19 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32, persisten
         .expect("request device");
 
     // --- Geometry + uniforms ---
-    let segments = geometry::wireframe_cube(0.7);
+    // COPY_DST because animated scenes (Lissajous) rewrite the segments once
+    // per simulated frame; the segment count is fixed.
+    let segments = scene.segments(time);
     let instance_count = segments.len() as u32;
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("segments"),
         contents: bytemuck::cast_slice(&segments),
-        usage: wgpu::BufferUsages::VERTEX,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
 
     // Rewritten once per simulated frame (the MVP advances), hence COPY_DST.
     let uniforms_at = |t: f32| BeamUniforms {
-        mvp: beam_mvp(width as f32 / height as f32, t).to_cols_array(),
+        mvp: beam_mvp(scene, width as f32 / height as f32, t).to_cols_array(),
         resolution: [width as f32, height as f32],
         // Slightly wider than the interactive default so beams read well at the
         // higher still-image resolution.
@@ -273,6 +289,10 @@ async fn capture_async(path: &str, width: u32, height: u32, time: f32, persisten
     for i in 0..steps {
         let t = time - (steps - 1 - i) as f32 * dt;
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms_at(t)));
+        if scene.animated() {
+            let segments = scene.segments(t);
+            queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&segments));
+        }
 
         let mut encoder = device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sim frame") });
