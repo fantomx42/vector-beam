@@ -7,7 +7,10 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::{beam_mvp, geometry, make_decay_pipeline, BeamUniforms, HDR_FORMAT, SEGMENT_ATTRS};
+use crate::{
+    beam_mvp, bloom, geometry, make_decay_pipeline, make_hdr_target, make_tonemap_bind_group,
+    make_tonemap_layout, BeamUniforms, HDR_FORMAT, SEGMENT_ATTRS,
+};
 
 /// The swapchain is sRGB at runtime; match that here so the read-back bytes are
 /// already sRGB-encoded and drop straight into a PNG.
@@ -148,30 +151,10 @@ async fn capture_async(
     // --- Decay pipeline (phosphor persistence: fades the HDR target) ---
     let decay_pipeline = make_decay_pipeline(&device);
 
-    // --- Tonemap pipeline (HDR texture -> sRGB output) ---
+    // --- Tonemap pipeline (HDR + bloom textures -> sRGB output) ---
     let tonemap_shader =
         device.create_shader_module(wgpu::include_wgsl!("../shaders/tonemap.wgsl"));
-    let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tonemap bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
+    let tonemap_layout = make_tonemap_layout(&device);
     let tonemap_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("tonemap pl layout"),
         bind_group_layouts: &[Some(&tonemap_layout)],
@@ -204,21 +187,7 @@ async fn capture_async(
     });
 
     // --- Targets ---
-    let hdr = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("hdr target"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: HDR_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let hdr_view = hdr.create_view(&wgpu::TextureViewDescriptor::default());
+    let hdr_view = make_hdr_target(&device, width, height);
 
     let out = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("output"),
@@ -242,20 +211,9 @@ async fn capture_async(
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    let tonemap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tonemap bg"),
-        layout: &tonemap_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&hdr_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
+    let bloom = bloom::Bloom::new(&device, &sampler, &hdr_view, width, height);
+    let tonemap_bind_group =
+        make_tonemap_bind_group(&device, &tonemap_layout, &sampler, &hdr_view, bloom.output_view());
 
     // Readback buffer. Rows in a texture-to-buffer copy must be aligned to
     // COPY_BYTES_PER_ROW_ALIGNMENT (256 bytes), so pad and strip afterwards.
@@ -330,9 +288,12 @@ async fn capture_async(
         queue.submit(Some(encoder.finish()));
     }
 
-    // --- Tonemap + read back ---
+    // --- Bloom + tonemap + read back ---
+    // The bloom chain only feeds the tonemap, so it runs once over the final
+    // accumulated HDR image rather than per simulated frame.
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture") });
+    bloom.encode(&mut encoder);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("tonemap pass"),

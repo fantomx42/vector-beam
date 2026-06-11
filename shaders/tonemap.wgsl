@@ -1,10 +1,12 @@
 // Tonemap pass: resolve the HDR (Rgba16Float) beam target down to the sRGB
-// swapchain. A fullscreen triangle samples the HDR texture, applies an exposure
-// scale and Reinhard tonemapping. The surface is an *_srgb format, so the GPU
-// encodes the linear result to sRGB for us on write.
+// swapchain. A fullscreen triangle samples the HDR texture, adds the blurred
+// bloom halo (half resolution; the bilinear sampler upsamples it for free),
+// then applies an exposure scale and Reinhard tonemapping. The surface is an
+// *_srgb format, so the GPU encodes the linear result to sRGB for us on write.
 
 @group(0) @binding(0) var hdr_tex: texture_2d<f32>;
 @group(0) @binding(1) var hdr_samp: sampler;
+@group(0) @binding(2) var bloom_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -31,9 +33,11 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let hdr = textureSample(hdr_tex, hdr_samp, in.uv).rgb;
+    let bloom = textureSample(bloom_tex, hdr_samp, in.uv).rgb;
 
     let exposure = 1.1;
-    let c = hdr * exposure;
+    let bloom_strength = 0.7;
+    let c = (hdr + bloom * bloom_strength) * exposure;
     let mapped = c / (c + vec3<f32>(1.0)); // Reinhard
 
     return vec4<f32>(mapped, 1.0);

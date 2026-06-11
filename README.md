@@ -65,6 +65,13 @@ The interesting part is the shader, [`shaders/beam.wgsl`](shaders/beam.wgsl).
   target with additive blending so overlapping strokes *accumulate* light, then
   a fullscreen [`shaders/tonemap.wgsl`](shaders/tonemap.wgsl) pass applies
   exposure + Reinhard tonemapping and resolves to the sRGB swapchain.
+- **Bloom.** The hottest parts of the image bleed a wide halo, like a bright
+  trace blooming on CRT glass. [`shaders/bloom.wgsl`](shaders/bloom.wgsl) runs
+  three quarter-resolution passes (host side in [`src/bloom.rs`](src/bloom.rs)):
+  a bright-pass downsample with a soft threshold knee (only HDR values above
+  ~1.0 bloom — fresh cores and dwell-hot spots, not the faded trails), then a
+  separable 9-tap Gaussian blur. The tonemap pass adds the result back, with
+  the bilinear sampler upsampling the quarter-res halo for free.
 - **Phosphor persistence.** The HDR target is never cleared; instead, each frame
   starts by fading it with a fullscreen [`shaders/decay.wgsl`](shaders/decay.wgsl)
   draw before the new beams are added on top, so strokes linger and fade like
