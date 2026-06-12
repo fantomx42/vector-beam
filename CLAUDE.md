@@ -18,11 +18,13 @@ cargo run --release                                   # tumbling wireframe cube,
 cargo run --release -- --scene ship                   # Asteroids-style ship (arrows/WASD) — the way to feel latency
 cargo run --release -- --scene ufo                    # motion-clarity test pattern; toggle scan with S
 cargo run --release -- --scene lissajous              # morphing 3D Lissajous curve
-cargo run --release -- --screenshot docs/screenshot.png 1280x960   # headless PNG capture
+cargo run --release -- --scene draw                   # interactive storage-scope drawing
+cargo run --release -- --screenshot docs/screenshot.png 1280x960   # headless PNG capture (rejects draw)
 ```
 
 Key flags (parsed in `src/cli.rs`): `--persistence <s>` (phosphor decay; default
-3 ms in scan mode, 100 ms with `--no-scan`; 0 disables), `--scan-hz` / `--hw-hz`
+3 ms in scan mode, 100 ms with `--no-scan`, 1 s in the draw scene; 0 disables),
+`--scan-hz` / `--hw-hz`
 (logical scan rate vs. panel rate), `--beams <B>` and `--beam-gain <x>`
 (multi-beam simulation), `--present-mode immediate|mailbox|fifo` (defaults to
 lowest-latency supported), `--fullscreen` (needed for direct scanout), `--no-scan`
@@ -33,10 +35,10 @@ work but the beam pass is heavy; prefer `--release`.
 
 ## Branch state (as of 2026-06-12)
 
-Branch `draw-scene` holds an unmerged v0.2.3 interactive storage-scope drawing
-scene (`--scene draw`, cursor strokes burned into phosphor) written against the
-pre-scan architecture; its `--present vsync|fast` flag was superseded by
-`--present-mode`. Porting it onto the scan architecture is open work.
+The v0.2.3 draw scene has been ported onto the scan architecture on `main`;
+branch `draw-scene` is the historical pre-port implementation and can be
+deleted. The draw scene always forces scan mode off (draw-once storage-scope
+strokes can't survive scan slicing — see the `Scene::Draw` doc comment).
 
 ## Architecture
 
@@ -72,10 +74,15 @@ Render pipeline, in frame order (passes set up in `src/main.rs::GpuState`):
    resolves to the sRGB swapchain.
 
 Scenes live in `src/geometry.rs` behind the `Scene` enum; a scene owns its
-segments, model matrix, and a fixed instance-buffer capacity. The `ship` scene
-is input-driven (closed-loop steering exists specifically to make latency
-perceptible); `ufo` is a steady scroller for eye-tracked motion-clarity
-comparison; `lissajous` regenerates segments every frame; `cube` is rigid.
+segments, model matrix, and a fixed instance-buffer capacity (`max_segments`).
+The `ship` scene is input-driven (closed-loop steering exists specifically to
+make latency perceptible); `ufo` is a steady scroller for eye-tracked
+motion-clarity comparison; `lissajous` regenerates segments every frame;
+`cube` is rigid. `draw` is the storage scope: `segments()` returns nothing,
+`main.rs` builds segments per frame from cursor input (queued on `InputState`,
+drained at render time), only *new* movement is drawn, and the decayed HDR
+buffer is the stroke memory — it always runs in no-scan mode with a 1 s
+persistence default.
 
 `src/telemetry.rs` prints a 5-second line of input-to-submit percentiles and
 GPU frame time (timestamp queries where supported) — use it to verify latency

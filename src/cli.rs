@@ -80,7 +80,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         None => Scene::default(),
         Some(name) => Scene::parse(name)
             .ok_or_else(|| {
-                format!("--scene expects one of: cube, lissajous, ship, ufo (got {name:?})")
+                format!("--scene expects one of: cube, lissajous, ship, ufo, draw (got {name:?})")
             })?,
     };
 
@@ -113,6 +113,11 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             height,
         }
     });
+    if screenshot.is_some() && scene == Scene::Draw {
+        return Err(
+            "--scene draw is interactive only; there is no cursor input headlessly".to_string(),
+        );
+    }
 
     let scan_hz = match flag_value(args, "--scan-hz") {
         None => 60.0,
@@ -233,6 +238,13 @@ mod tests {
             Scene::Lissajous
         );
         assert!(parse(&args(&["--scene", "teapot"])).is_err());
+    }
+
+    #[test]
+    fn draw_scene_parses_but_rejects_screenshot() {
+        assert_eq!(parse(&args(&["--scene", "draw"])).unwrap().scene, Scene::Draw);
+        assert!(parse(&args(&["--scene", "draw", "--screenshot"])).is_err());
+        assert!(parse(&args(&["--screenshot", "out.png"])).is_ok());
     }
 
     #[test]

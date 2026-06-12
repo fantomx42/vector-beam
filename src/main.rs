@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -56,6 +55,11 @@ pub(crate) const DEFAULT_PERSISTENCE: f32 = 0.1;
 /// hardware frames at 240 Hz) would smear away exactly the motion clarity the
 /// scan buys; 3 ms keeps a stroke visible across roughly one scan period.
 pub(crate) const DEFAULT_PERSISTENCE_SCAN: f32 = 0.003;
+
+/// Default persistence for the draw scene: the storage-scope regime. Strokes
+/// are drawn once and the phosphor *is* the stroke memory, so the fast
+/// defaults above would erase a drawing almost as it's made.
+pub(crate) const DEFAULT_PERSISTENCE_DRAW: f32 = 1.0;
 
 /// Build the render pipeline for `shaders/decay.wgsl`: a fullscreen triangle
 /// whose only effect is the fixed-function blend `dst * blend_constant`, fading
@@ -125,6 +129,18 @@ pub(crate) fn beam_mvp(
     proj * view * user_model.unwrap_or_else(|| scene.model(time))
 }
 
+/// Map a cursor position in window pixels onto the world z=0 plane the draw
+/// scene lives on: pixel -> NDC, then cast the ray between the unprojected
+/// near- and far-plane points and intersect it with z=0.
+fn cursor_to_plane(inv_vp: glam::Mat4, px: f64, py: f64, width: f32, height: f32) -> glam::Vec3 {
+    let ndc_x = 2.0 * px as f32 / width - 1.0;
+    let ndc_y = 1.0 - 2.0 * py as f32 / height;
+    let near = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 0.0));
+    let far = inv_vp.project_point3(glam::vec3(ndc_x, ndc_y, 1.0));
+    let t = near.z / (near.z - far.z);
+    near + (far - near) * t
+}
+
 /// Flight keys currently held, owned by `App` and mutated by window events.
 /// The renderer reads it once per frame, immediately before building uniforms
 /// (after the swapchain block), so control input is as fresh as possible.
@@ -133,6 +149,10 @@ struct InputState {
     turn_left: bool,
     turn_right: bool,
     thrust: bool,
+    /// Draw-scene input: cursor positions queued by window events (several can
+    /// arrive per frame) and drained at render time — the same late-sampling
+    /// placement as the flight keys.
+    cursor_points: Vec<winit::dpi::PhysicalPosition<f64>>,
     /// Timestamp of the most recent input edge (key press/release), consumed
     /// by the latency probe after the frame folding it in is submitted.
     last_event: Option<Instant>,
@@ -263,6 +283,9 @@ struct GpuState {
 
     scene: geometry::Scene,
     ship: ShipState,
+    /// Where last frame's draw-scene stroke ended, so strokes stay connected
+    /// across frames; `None` = pen lifted.
+    last_world: Option<glam::Vec3>,
 
     // Scan scheduler state: which slice of the stroke list each hardware
     // frame draws. `scan_enabled` is runtime-toggleable; `beam_gain`
@@ -356,15 +379,19 @@ impl GpuState {
         surface.configure(&device, &config);
 
         // --- Geometry ---
-        // COPY_DST because animated scenes (Lissajous) rewrite the segments
-        // every frame; the segment count is fixed, so the buffer never grows.
+        // Sized to the scene's fixed capacity; COPY_DST because animated and
+        // draw scenes rewrite the contents every frame.
         let segments = scene.segments(0.0);
         let instance_count = segments.len() as u32;
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("segments"),
-            contents: bytemuck::cast_slice(&segments),
+            size: (scene.max_segments() * std::mem::size_of::<geometry::Segment>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        if !segments.is_empty() {
+            queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&segments));
+        }
 
         // --- Scan scheduler ---
         // Each stroke is lit 1/N of the scan cycle, so intensity is multiplied
@@ -532,6 +559,7 @@ impl GpuState {
             last_frame: Instant::now(),
             scene,
             ship: ShipState::default(),
+            last_world: None,
             scan,
             scan_enabled: opts.scan_enabled,
             beam_gain,
@@ -569,6 +597,56 @@ impl GpuState {
         );
     }
 
+    /// Phosphor time constant in effect: an explicit `--persistence` wins,
+    /// then the scene/mode default (storage scope for draw, fast phosphor in
+    /// scan mode, legacy otherwise).
+    fn persistence(&self) -> f32 {
+        self.persistence_override.unwrap_or(match () {
+            _ if self.scene == geometry::Scene::Draw => DEFAULT_PERSISTENCE_DRAW,
+            _ if self.scan_enabled => DEFAULT_PERSISTENCE_SCAN,
+            _ => DEFAULT_PERSISTENCE,
+        })
+    }
+
+    /// Drain the queued cursor positions into this frame's draw-scene
+    /// segments: a polyline continuing last frame's stroke endpoint, plus a
+    /// beam crosshair at the pen. History is not re-drawn — it lives in the
+    /// persistent phosphor buffer, like a real storage scope.
+    fn drain_draw_segments(&mut self, input: &mut InputState, aspect: f32) -> Vec<geometry::Segment> {
+        let inv_vp = beam_mvp(geometry::Scene::Draw, aspect, 0.0, None).inverse();
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        let stroke = [0.35, 1.0, 0.55];
+        let crosshair = [0.30, 0.95, 0.95];
+
+        let mut segments = Vec::new();
+        for p in input.cursor_points.drain(..) {
+            let world = cursor_to_plane(inv_vp, p.x, p.y, w, h);
+            if let Some(prev) = self.last_world {
+                segments.push(geometry::Segment::new(prev.into(), world.into(), stroke));
+            }
+            self.last_world = Some(world);
+        }
+        // Capacity-bounded (the crosshair takes 2): keep the newest movement.
+        let cap = self.scene.max_segments() - 2;
+        if segments.len() > cap {
+            segments.drain(..segments.len() - cap);
+        }
+        if let Some(p) = self.last_world {
+            let s = 0.05;
+            segments.push(geometry::Segment::new(
+                [p.x - s, p.y, p.z],
+                [p.x + s, p.y, p.z],
+                crosshair,
+            ));
+            segments.push(geometry::Segment::new(
+                [p.x, p.y - s, p.z],
+                [p.x, p.y + s, p.z],
+                crosshair,
+            ));
+        }
+        segments
+    }
+
     fn render(&mut self, start: Instant, input: &mut InputState) {
         // Acquire the swapchain frame FIRST: under Fifo this is where the loop
         // blocks for vsync, so everything sampled after it (timing, animation
@@ -595,13 +673,9 @@ impl GpuState {
         // Framerate-independent phosphor fade for this frame. With persistence
         // disabled the factor is 0, which multiplies the old frame away entirely
         // (equivalent to the pre-persistence clear). The default time constant
-        // depends on the mode: scan mode needs a fast phosphor or the slices
-        // smear back together.
-        let persistence = self.persistence_override.unwrap_or(if self.scan_enabled {
-            DEFAULT_PERSISTENCE_SCAN
-        } else {
-            DEFAULT_PERSISTENCE
-        });
+        // depends on the scene and mode: scan mode needs a fast phosphor or
+        // the slices smear back together; the draw scene needs a slow one.
+        let persistence = self.persistence();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -611,16 +685,25 @@ impl GpuState {
             0.0
         };
 
+        let aspect = self.config.width as f32 / self.config.height as f32;
         // Animate: the scene's model matrix always moves; a morphing scene
         // (Lissajous) additionally regenerates its segments each frame, and the
-        // scan buckets must track the regenerated arc lengths.
-        if self.scene.animated() {
+        // scan buckets must track the regenerated arc lengths. The draw scene
+        // builds its segments from cursor input sampled now, at render time
+        // (no scan rebuild — it always runs with scan off).
+        if self.scene == geometry::Scene::Draw {
+            let segments = self.drain_draw_segments(input, aspect);
+            self.instance_count = segments.len() as u32;
+            if !segments.is_empty() {
+                self.queue
+                    .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&segments));
+            }
+        } else if self.scene.animated() {
             let segments = self.scene.segments(time);
             self.queue
                 .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&segments));
             self.scan.rebuild(&segments);
         }
-        let aspect = self.config.width as f32 / self.config.height as f32;
         // Input-driven scene: fold the freshly sampled controls into the ship
         // state right here, so nothing sits between the input read and the
         // uniform upload below.
@@ -630,11 +713,25 @@ impl GpuState {
         });
         let mvp = beam_mvp(self.scene, aspect, time, user_model);
 
+        // Scan mode compensates for each stroke being lit only 1/N of the
+        // scan; the no-scan path with persistence accumulates light across
+        // frames, so emission must be energy per unit *time*, not per frame —
+        // otherwise an uncapped frame rate (Immediate present) over-accumulates
+        // ~fps/60 times hotter. Normalized so 60 Hz matches the original look;
+        // clamped so a stall doesn't flash. Without persistence frames are
+        // independent and per-frame strength is already correct.
+        let brightness = if self.scan_enabled {
+            self.beam_gain
+        } else if persistence > 0.0 {
+            (dt * 60.0).min(2.0)
+        } else {
+            1.0
+        };
         let uniforms = BeamUniforms {
             mvp: mvp.to_cols_array(),
             resolution: [self.config.width as f32, self.config.height as f32],
             base_width: 6.0,
-            brightness: if self.scan_enabled { self.beam_gain } else { 1.0 },
+            brightness,
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -840,6 +937,12 @@ impl ApplicationHandler for App {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // In draw mode the beam crosshair *is* the cursor; the compositor's
+        // hardware cursor would sit on top of it, always a frame or two ahead,
+        // and give the latency away.
+        if self.opts.scene == geometry::Scene::Draw {
+            window.set_cursor_visible(false);
+        }
         // Hardware refresh rate: explicit --hw-hz wins, then the monitor's
         // reported rate, then 60 as a conservative fallback. Note: a VRR panel
         // re-times scanout and jitters the scan cadence — run fixed-rate.
@@ -882,19 +985,20 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowRight | KeyCode::KeyD => self.input.turn_right = pressed,
                     KeyCode::ArrowUp | KeyCode::KeyW => self.input.thrust = pressed,
                     // Motion-clarity A/B switch: toggle scan mode live (the
-                    // persistence default follows the mode).
+                    // persistence default follows the mode). The draw scene's
+                    // draw-once strokes can't survive scan slicing, so it
+                    // stays in no-scan mode.
                     KeyCode::KeyS if pressed && !event.repeat => {
+                        if gpu.scene == geometry::Scene::Draw {
+                            eprintln!("scan mode: unavailable in the draw scene (storage-scope strokes are drawn once)");
+                            return;
+                        }
                         gpu.scan_enabled = !gpu.scan_enabled;
                         gpu.scan.reset();
-                        let tau = gpu.persistence_override.unwrap_or(if gpu.scan_enabled {
-                            DEFAULT_PERSISTENCE_SCAN
-                        } else {
-                            DEFAULT_PERSISTENCE
-                        });
                         eprintln!(
                             "scan mode: {} (persistence {:.1} ms)",
                             if gpu.scan_enabled { "on" } else { "off" },
-                            tau * 1e3,
+                            gpu.persistence() * 1e3,
                         );
                         return;
                     }
@@ -905,6 +1009,19 @@ impl ApplicationHandler for App {
                 if !event.repeat {
                     self.input.last_event = Some(Instant::now());
                 }
+            }
+            // Draw-scene pen input: queue every position (several can arrive
+            // per frame); render() drains them as late as possible. Leaving
+            // the window lifts the pen so re-entry doesn't draw a jump line.
+            WindowEvent::CursorMoved { position, .. }
+                if gpu.scene == geometry::Scene::Draw =>
+            {
+                self.input.cursor_points.push(position);
+                self.input.last_event = Some(Instant::now());
+            }
+            WindowEvent::CursorLeft { .. } if gpu.scene == geometry::Scene::Draw => {
+                self.input.cursor_points.clear();
+                gpu.last_world = None;
             }
             WindowEvent::RedrawRequested => {
                 let start = self.start.unwrap_or_else(Instant::now);
@@ -953,7 +1070,8 @@ fn main() {
             scan_cfg: scan::ScanConfig { scan_hz: cli.scan_hz, beams: cli.beams },
             hw_hz: cli.hw_hz,
             beam_gain: cli.beam_gain,
-            scan_enabled: !cli.no_scan,
+            // Draw-once storage-scope strokes can't survive scan slicing.
+            scan_enabled: !cli.no_scan && cli.scene != geometry::Scene::Draw,
         },
         fullscreen: cli.fullscreen,
         ..App::default()

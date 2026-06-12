@@ -27,6 +27,12 @@ pub enum Scene {
     /// motion-clarity pattern): track it with your eyes and toggle scan mode
     /// with S — the difference in edge clarity is the verification.
     Ufo,
+    /// Interactive storage scope: segments come from mouse input (built per
+    /// frame in `main`, so `segments` returns nothing) and stroke history
+    /// lives in the phosphor buffer, not in any list. Draw-once semantics are
+    /// the opposite of the scan scheduler's redraw-every-cycle contract, so
+    /// this scene always runs with scan mode off.
+    Draw,
 }
 
 impl Scene {
@@ -36,6 +42,7 @@ impl Scene {
             "lissajous" => Some(Scene::Lissajous),
             "ship" => Some(Scene::Ship),
             "ufo" => Some(Scene::Ufo),
+            "draw" => Some(Scene::Draw),
             _ => None,
         }
     }
@@ -54,6 +61,20 @@ impl Scene {
             Scene::Lissajous => lissajous(600, time),
             Scene::Ship => ship(),
             Scene::Ufo => ufo(),
+            Scene::Draw => Vec::new(),
+        }
+    }
+
+    /// Instance-buffer capacity in segments. Fixed per scene so the buffer
+    /// never needs to grow; the draw scene's headroom covers a crosshair plus
+    /// one frame's worth of cursor movement (history lives in the phosphor).
+    pub fn max_segments(self) -> usize {
+        match self {
+            Scene::Cube => 12,
+            Scene::Lissajous => 600,
+            Scene::Ship => 5,
+            Scene::Ufo => 18,
+            Scene::Draw => 256,
         }
     }
 
@@ -74,6 +95,8 @@ impl Scene {
             }
             Scene::Lissajous => glam::Mat4::from_rotation_y(time * 0.25),
             Scene::Ship => glam::Mat4::IDENTITY,
+            // The draw scene is a flat board at z = 0 facing the camera.
+            Scene::Draw => glam::Mat4::IDENTITY,
             // Constant-velocity horizontal scroll, wrapping at +-2 world
             // units. Steady speed matters: the eye must be able to smoothly
             // pursue the glyph for the motion-clarity comparison to read.
@@ -97,7 +120,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    fn new(a: [f32; 3], b: [f32; 3], color: [f32; 3]) -> Self {
+    pub fn new(a: [f32; 3], b: [f32; 3], color: [f32; 3]) -> Self {
         Self { p0: a, p1: b, color }
     }
 }

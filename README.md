@@ -19,7 +19,8 @@ Needs a GPU with a Vulkan / Metal / DX12 / GL backend (anything wgpu supports).
 
 The trail length is tunable with `--persistence <seconds>` (the phosphor decay
 time constant); `--persistence 0` disables trails entirely. The default depends
-on the mode: 3 ms in scan mode (below), 100 ms with `--no-scan`.
+on the mode: 3 ms in scan mode (below), 100 ms with `--no-scan`, 1 s in the
+draw scene.
 
 ### Beam scan mode
 
@@ -71,6 +72,16 @@ cargo run --release -- --scene lissajous
 ```
 
 ![A morphing 3D Lissajous curve drawn as a hot phosphor trace](docs/lissajous.png)
+
+- `draw` — an interactive storage scope: the OS cursor disappears and a beam
+  crosshair chases the mouse, burning fading phosphor strokes as it moves.
+  Strokes are drawn once and remembered by the phosphor (persistence defaults
+  to 1 s here), which is the opposite of scan mode's redraw-every-cycle
+  contract — so this scene always runs with scan mode off:
+
+```sh
+cargo run --release -- --scene draw
+```
 
 ### Regenerate the screenshot
 
