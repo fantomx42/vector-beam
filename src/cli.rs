@@ -59,6 +59,9 @@ pub struct Cli {
     pub beam_gain: Option<f32>,
     /// Start with scan mode off (`--no-scan`).
     pub no_scan: bool,
+    /// Simultaneous beams (`--beams`, default 1): the stroke list is split
+    /// into this many arcs, each subframe drawing one bucket from every arc.
+    pub beams: u32,
 }
 
 /// Parse `args` (including `argv[0]`). Errors are user-facing messages for
@@ -144,6 +147,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         ),
     };
 
+    let beams = match flag_value(args, "--beams") {
+        None => 1,
+        Some(v) => {
+            let b: u32 = v
+                .parse()
+                .map_err(|_| format!("--beams expects a count (got {v:?})"))?;
+            if b == 0 {
+                return Err("--beams must be at least 1".to_string());
+            }
+            b
+        }
+    };
+
     Ok(Cli {
         persistence,
         scene,
@@ -154,6 +170,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         hw_hz,
         beam_gain,
         no_scan: flag_present(args, "--no-scan"),
+        beams,
     })
 }
 
@@ -275,5 +292,13 @@ mod tests {
         assert!(parse(&args(&["--scan-hz", "0"])).is_err());
         assert!(parse(&args(&["--hw-hz", "-60"])).is_err());
         assert!(parse(&args(&["--beam-gain", "lots"])).is_err());
+    }
+
+    #[test]
+    fn beams_flag() {
+        assert_eq!(parse(&args(&[])).unwrap().beams, 1);
+        assert_eq!(parse(&args(&["--beams", "3"])).unwrap().beams, 3);
+        assert!(parse(&args(&["--beams", "0"])).is_err());
+        assert!(parse(&args(&["--beams", "many"])).is_err());
     }
 }

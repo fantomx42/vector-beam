@@ -792,7 +792,7 @@ fn main() {
             persistence: cli.persistence,
             scene: cli.scene,
             present_mode: cli.present_mode,
-            scan_cfg: scan::ScanConfig { scan_hz: cli.scan_hz, beams: 1 },
+            scan_cfg: scan::ScanConfig { scan_hz: cli.scan_hz, beams: cli.beams },
             hw_hz: cli.hw_hz,
             beam_gain: cli.beam_gain,
             scan_enabled: !cli.no_scan,
