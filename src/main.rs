@@ -6,6 +6,7 @@
 //! only animated input is the MVP matrix, updated per frame.
 
 mod bloom;
+mod cli;
 mod geometry;
 mod screenshot;
 
@@ -98,6 +99,40 @@ pub(crate) fn beam_mvp(scene: geometry::Scene, aspect: f32, time: f32) -> glam::
     proj * view * scene.model(time)
 }
 
+/// Everything the live window needs to construct a `GpuState`, gathered from
+/// the CLI before the event loop starts.
+#[derive(Default)]
+struct RenderOptions {
+    /// `None` = use the default persistence time constant.
+    persistence: Option<f32>,
+    scene: geometry::Scene,
+    present_mode: Option<cli::PresentModeArg>,
+}
+
+/// Pick the swapchain present mode: honor an explicit `--present-mode` when
+/// the surface supports it, otherwise prefer the lowest-latency mode
+/// available (Immediate beats Mailbox beats Fifo).
+fn choose_present_mode(
+    supported: &[wgpu::PresentMode],
+    requested: Option<cli::PresentModeArg>,
+) -> wgpu::PresentMode {
+    if let Some(req) = requested {
+        let mode = req.to_wgpu();
+        if supported.contains(&mode) {
+            return mode;
+        }
+        eprintln!("requested present mode {mode:?} not supported (surface offers {supported:?}); auto-selecting");
+    }
+    [
+        wgpu::PresentMode::Immediate,
+        wgpu::PresentMode::Mailbox,
+        wgpu::PresentMode::Fifo,
+    ]
+    .into_iter()
+    .find(|m| supported.contains(m))
+    .unwrap_or(wgpu::PresentMode::Fifo)
+}
+
 struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -132,7 +167,9 @@ struct GpuState {
 }
 
 impl GpuState {
-    async fn new(window: Arc<Window>, persistence: f32, scene: geometry::Scene) -> Self {
+    async fn new(window: Arc<Window>, opts: &RenderOptions) -> Self {
+        let persistence = opts.persistence.unwrap_or(DEFAULT_PERSISTENCE);
+        let scene = opts.scene;
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -172,13 +209,19 @@ impl GpuState {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        // Latency substrate: at most one frame queued ahead of the display,
+        // and the lowest-latency present mode the surface offers (overridable
+        // with --present-mode). Immediate tears but never waits; Mailbox
+        // replaces the queued frame; Fifo is the vsync fallback.
+        let present_mode = choose_present_mode(&caps.present_modes, opts.present_mode);
+        eprintln!("present mode: {present_mode:?}");
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            present_mode,
+            desired_maximum_frame_latency: 1,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -371,7 +414,29 @@ impl GpuState {
         );
     }
 
-    fn render(&mut self, time: f32) {
+    fn render(&mut self, start: Instant) {
+        // Acquire the swapchain frame FIRST: under Fifo this is where the loop
+        // blocks for vsync, so everything sampled after it (timing, animation
+        // state, uniforms) is as fresh as possible when the frame is submitted.
+        // Nothing latency-sensitive may run before this point.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // Swapchain went stale (resize/minimize) — reconfigure and skip this frame.
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            // Timeout / Occluded / Validation — skip this frame and try again next tick.
+            _ => return,
+        };
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Sample time only now, after the block above, so the MVP reflects the
+        // moment of submission rather than the moment the redraw was requested.
+        let time = start.elapsed().as_secs_f32();
+
         // Framerate-independent phosphor fade for this frame. With persistence
         // disabled the factor is 0, which multiplies the old frame away entirely
         // (equivalent to the pre-persistence clear).
@@ -402,20 +467,6 @@ impl GpuState {
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            // Swapchain went stale (resize/minimize) — reconfigure and skip this frame.
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            // Timeout / Occluded / Validation — skip this frame and try again next tick.
-            _ => return,
-        };
-        let surface_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
@@ -568,8 +619,8 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     start: Option<Instant>,
-    persistence: f32,
-    scene: geometry::Scene,
+    opts: RenderOptions,
+    fullscreen: bool,
 }
 
 impl ApplicationHandler for App {
@@ -577,17 +628,17 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("vector-beam")
-                        .with_inner_size(winit::dpi::LogicalSize::new(960.0, 720.0)),
-                )
-                .expect("create window"),
-        );
-        let gpu =
-            pollster::block_on(GpuState::new(window.clone(), self.persistence, self.scene));
+        // Borderless fullscreen is a latency feature, not cosmetics: a
+        // fullscreen surface can be scanned out directly, while a windowed one
+        // always goes through a compositor copy.
+        let mut attrs = Window::default_attributes()
+            .with_title("vector-beam")
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 720.0));
+        if self.fullscreen {
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let gpu = pollster::block_on(GpuState::new(window.clone(), &self.opts));
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.start = Some(Instant::now());
@@ -606,8 +657,8 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                let t = self.start.map(|s| s.elapsed().as_secs_f32()).unwrap_or(0.0);
-                gpu.render(t);
+                let start = self.start.unwrap_or_else(Instant::now);
+                gpu.render(start);
             }
             _ => {}
         }
@@ -623,51 +674,34 @@ impl ApplicationHandler for App {
 fn main() {
     // Headless mode: `vector-beam --screenshot [path] [WxH]` renders one frame to
     // a PNG and exits, with no window. Everything else opens the live window.
-    // `--persistence <seconds>` sets the phosphor fade time constant in either
-    // mode (0 disables trails); `--scene cube|lissajous` picks the demo scene.
+    // See cli.rs for the full flag set.
     let args: Vec<String> = std::env::args().collect();
-    let persistence = args
-        .iter()
-        .position(|a| a == "--persistence")
-        .and_then(|p| args.get(p + 1))
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(DEFAULT_PERSISTENCE)
-        .max(0.0);
-    let scene = match args.iter().position(|a| a == "--scene").map(|p| args.get(p + 1)) {
-        None => geometry::Scene::default(),
-        Some(name) => match name.and_then(|n| geometry::Scene::parse(n)) {
-            Some(scene) => scene,
-            None => {
-                eprintln!(
-                    "--scene expects one of: cube, lissajous (got {:?})",
-                    name.map(String::as_str).unwrap_or("nothing")
-                );
-                std::process::exit(2);
-            }
-        },
+    let cli = match cli::parse(&args) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
     };
-    if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
-        let path = args
-            .get(pos + 1)
-            .filter(|a| !a.starts_with("--"))
-            .cloned()
-            .unwrap_or_else(|| "docs/screenshot.png".to_string());
-        let (width, height) = args
-            .get(pos + 2)
-            .and_then(|s| s.split_once('x'))
-            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
-            .unwrap_or((1280, 960));
-        // A few seconds in, the cube sits at a pleasant three-quarter angle.
-        screenshot::capture(&path, width, height, 2.6, persistence, scene);
-        println!("wrote {path} ({width}x{height})");
+    if let Some(shot) = &cli.screenshot {
+        // The capture always renders the full scene per simulated frame with
+        // the legacy persistence default; a few seconds in, the cube sits at a
+        // pleasant three-quarter angle.
+        let persistence = cli.persistence.unwrap_or(DEFAULT_PERSISTENCE);
+        screenshot::capture(&shot.path, shot.width, shot.height, 2.6, persistence, cli.scene);
+        println!("wrote {} ({}x{})", shot.path, shot.width, shot.height);
         return;
     }
 
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
-        persistence,
-        scene,
+        opts: RenderOptions {
+            persistence: cli.persistence,
+            scene: cli.scene,
+            present_mode: cli.present_mode,
+        },
+        fullscreen: cli.fullscreen,
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");

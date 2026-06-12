@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 /// Lissajous curve *morphs* (its phase drifts over time), so its segments are
 /// regenerated every frame and the host must upload them with
 /// `queue.write_buffer` instead of a one-time buffer init.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Scene {
     #[default]
     Cube,
