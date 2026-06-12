@@ -19,6 +19,10 @@ pub enum Scene {
     #[default]
     Cube,
     Lissajous,
+    /// Turn/thrust Asteroids-style ship, flown with the keyboard — the
+    /// canonical input-latency feel test. The glyph is static; all motion
+    /// lives in a host-supplied model matrix driven by the flight keys.
+    Ship,
 }
 
 impl Scene {
@@ -26,6 +30,7 @@ impl Scene {
         match name {
             "cube" => Some(Scene::Cube),
             "lissajous" => Some(Scene::Lissajous),
+            "ship" => Some(Scene::Ship),
             _ => None,
         }
     }
@@ -42,6 +47,7 @@ impl Scene {
         match self {
             Scene::Cube => wireframe_cube(0.7),
             Scene::Lissajous => lissajous(600, time),
+            Scene::Ship => ship(),
         }
     }
 
@@ -53,13 +59,15 @@ impl Scene {
 
     /// Model matrix at `time`: tumble the cube around two axes; turn the
     /// Lissajous slowly around Y so its depth reads without overpowering the
-    /// curve's own morphing.
+    /// curve's own morphing. The ship has no autonomous motion — the host
+    /// overrides its model matrix from the flight controls.
     pub fn model(self, time: f32) -> glam::Mat4 {
         match self {
             Scene::Cube => {
                 glam::Mat4::from_rotation_y(time * 0.7) * glam::Mat4::from_rotation_x(time * 0.4)
             }
             Scene::Lissajous => glam::Mat4::from_rotation_y(time * 0.25),
+            Scene::Ship => glam::Mat4::IDENTITY,
         }
     }
 }
@@ -118,6 +126,24 @@ pub fn wireframe_cube(s: f32) -> Vec<Segment> {
             let color = if b == a + 4 { cyan } else { green };
             Segment::new(v[a], v[b], color)
         })
+        .collect()
+}
+
+/// The classic Asteroids dart at z = 0, nose up (+Y), in beam path order: one
+/// continuous stroke nose -> left fin -> left notch -> right notch -> right
+/// fin -> nose. About 0.24 world units tall against a view frustum ~3.5 units
+/// high at z = 0 — small enough that flying it across the screen is a real
+/// deflection test.
+pub fn ship() -> Vec<Segment> {
+    let green = [0.35, 1.0, 0.55];
+    let nose = [0.0, 0.12, 0.0];
+    let left_fin = [-0.08, -0.12, 0.0];
+    let left_notch = [-0.04, -0.07, 0.0];
+    let right_notch = [0.04, -0.07, 0.0];
+    let right_fin = [0.08, -0.12, 0.0];
+    let path = [nose, left_fin, left_notch, right_notch, right_fin, nose];
+    path.windows(2)
+        .map(|w| Segment::new(w[0], w[1], green))
         .collect()
 }
 

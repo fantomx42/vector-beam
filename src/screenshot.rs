@@ -69,7 +69,7 @@ async fn capture_async(
 
     // Rewritten once per simulated frame (the MVP advances), hence COPY_DST.
     let uniforms_at = |t: f32| BeamUniforms {
-        mvp: beam_mvp(scene, width as f32 / height as f32, t).to_cols_array(),
+        mvp: beam_mvp(scene, width as f32 / height as f32, t, None).to_cols_array(),
         resolution: [width as f32, height as f32],
         // Slightly wider than the interactive default so beams read well at the
         // higher still-image resolution.

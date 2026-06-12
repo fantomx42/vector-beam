@@ -99,17 +99,92 @@ pub(crate) fn make_decay_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline
     })
 }
 
-/// Model-view-projection for a scene at a given time, viewed from +Z (the
-/// scene supplies its own model motion). Shared by the live window and the
+/// Camera field of view and distance: shared by the MVP and the ship's
+/// screen-wrap bounds (the frustum half-height at the ship's z = 0 plane is
+/// `CAMERA_Z * tan(FOV_Y / 2)`).
+const FOV_Y_RADIANS: f32 = std::f32::consts::PI / 3.0; // 60 degrees
+const CAMERA_Z: f32 = 3.0;
+
+/// Model-view-projection for a scene at a given time, viewed from +Z. The
+/// scene supplies its own model motion unless the host passes `user_model`
+/// (input-driven scenes like the ship). Shared by the live window and the
 /// headless screenshot so both frame the scene identically.
-pub(crate) fn beam_mvp(scene: geometry::Scene, aspect: f32, time: f32) -> glam::Mat4 {
-    let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
+pub(crate) fn beam_mvp(
+    scene: geometry::Scene,
+    aspect: f32,
+    time: f32,
+    user_model: Option<glam::Mat4>,
+) -> glam::Mat4 {
+    let proj = glam::Mat4::perspective_rh(FOV_Y_RADIANS, aspect, 0.1, 100.0);
     let view = glam::Mat4::look_at_rh(
-        glam::Vec3::new(0.0, 0.0, 3.0),
+        glam::Vec3::new(0.0, 0.0, CAMERA_Z),
         glam::Vec3::ZERO,
         glam::Vec3::Y,
     );
-    proj * view * scene.model(time)
+    proj * view * user_model.unwrap_or_else(|| scene.model(time))
+}
+
+/// Flight keys currently held, owned by `App` and mutated by window events.
+/// The renderer reads it once per frame, immediately before building uniforms
+/// (after the swapchain block), so control input is as fresh as possible.
+#[derive(Default)]
+struct InputState {
+    turn_left: bool,
+    turn_right: bool,
+    thrust: bool,
+}
+
+/// Asteroids-style ship kinematics: turn and thrust with momentum, no drag,
+/// wrapping at the edges of the visible plane. Angle 0 points up (+Y),
+/// positive = counterclockwise.
+struct ShipState {
+    angle: f32,
+    vel: glam::Vec2,
+    pos: glam::Vec2,
+}
+
+impl Default for ShipState {
+    fn default() -> Self {
+        Self { angle: 0.0, vel: glam::Vec2::ZERO, pos: glam::Vec2::ZERO }
+    }
+}
+
+impl ShipState {
+    const TURN_RATE: f32 = 3.5; // rad/s
+    const ACCEL: f32 = 1.8; // world units/s^2
+    const WRAP_MARGIN: f32 = 0.15; // let the ship fully exit before it wraps
+
+    fn integrate(&mut self, input: &InputState, dt: f32, aspect: f32) {
+        let turn = input.turn_left as i32 - input.turn_right as i32;
+        self.angle += turn as f32 * Self::TURN_RATE * dt;
+        if input.thrust {
+            let dir = glam::Vec2::new(-self.angle.sin(), self.angle.cos());
+            self.vel += dir * Self::ACCEL * dt;
+        }
+        self.pos += self.vel * dt;
+
+        // Screen wrap at the frustum bounds of the ship's z = 0 plane.
+        let half_h = CAMERA_Z * (FOV_Y_RADIANS * 0.5).tan() + Self::WRAP_MARGIN;
+        let half_w = CAMERA_Z * (FOV_Y_RADIANS * 0.5).tan() * aspect + Self::WRAP_MARGIN;
+        self.pos.x = wrap(self.pos.x, half_w);
+        self.pos.y = wrap(self.pos.y, half_h);
+    }
+
+    fn model(&self) -> glam::Mat4 {
+        glam::Mat4::from_translation(self.pos.extend(0.0))
+            * glam::Mat4::from_rotation_z(self.angle)
+    }
+}
+
+/// Wrap `x` into [-half, half] by jumping to the opposite edge.
+fn wrap(x: f32, half: f32) -> f32 {
+    if x > half {
+        x - 2.0 * half
+    } else if x < -half {
+        x + 2.0 * half
+    } else {
+        x
+    }
 }
 
 /// Everything the live window needs to construct a `GpuState`, gathered from
@@ -183,6 +258,7 @@ struct GpuState {
     last_frame: Instant,
 
     scene: geometry::Scene,
+    ship: ShipState,
 
     // Scan scheduler state: which slice of the stroke list each hardware
     // frame draws. `scan_enabled` is runtime-toggleable; `beam_gain`
@@ -439,6 +515,7 @@ impl GpuState {
             persistence_override: opts.persistence,
             last_frame: Instant::now(),
             scene,
+            ship: ShipState::default(),
             scan,
             scan_enabled: opts.scan_enabled,
             beam_gain,
@@ -474,7 +551,7 @@ impl GpuState {
         );
     }
 
-    fn render(&mut self, start: Instant) {
+    fn render(&mut self, start: Instant, input: &InputState) {
         // Acquire the swapchain frame FIRST: under Fifo this is where the loop
         // blocks for vsync, so everything sampled after it (timing, animation
         // state, uniforms) is as fresh as possible when the frame is submitted.
@@ -526,7 +603,14 @@ impl GpuState {
             self.scan.rebuild(&segments);
         }
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let mvp = beam_mvp(self.scene, aspect, time);
+        // Input-driven scene: fold the freshly sampled controls into the ship
+        // state right here, so nothing sits between the input read and the
+        // uniform upload below.
+        let user_model = (self.scene == geometry::Scene::Ship).then(|| {
+            self.ship.integrate(input, dt, aspect);
+            self.ship.model()
+        });
+        let mvp = beam_mvp(self.scene, aspect, time, user_model);
 
         let uniforms = BeamUniforms {
             mvp: mvp.to_cols_array(),
@@ -700,6 +784,7 @@ struct App {
     start: Option<Instant>,
     opts: RenderOptions,
     fullscreen: bool,
+    input: InputState,
 }
 
 impl ApplicationHandler for App {
@@ -748,9 +833,25 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                let pressed = event.state.is_pressed();
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::ArrowLeft | KeyCode::KeyA) => {
+                        self.input.turn_left = pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowRight | KeyCode::KeyD) => {
+                        self.input.turn_right = pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::KeyW) => {
+                        self.input.thrust = pressed;
+                    }
+                    _ => {}
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let start = self.start.unwrap_or_else(Instant::now);
-                gpu.render(start);
+                gpu.render(start, &self.input);
             }
             _ => {}
         }
