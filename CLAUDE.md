@@ -19,6 +19,7 @@ cargo run --release -- --scene ship                   # Asteroids-style ship (ar
 cargo run --release -- --scene ufo                    # motion-clarity test pattern; toggle scan with S
 cargo run --release -- --scene lissajous              # morphing 3D Lissajous curve
 cargo run --release -- --scene draw                   # interactive storage-scope drawing
+cargo run --release -- --scene text --text "HELLO"    # stroke-font text (src/font.rs)
 cargo run --release -- --screenshot docs/screenshot.png 1280x960   # headless PNG capture (rejects draw)
 ```
 
@@ -28,7 +29,8 @@ Key flags (parsed in `src/cli.rs`): `--persistence <s>` (phosphor decay; default
 (logical scan rate vs. panel rate), `--beams <B>` and `--beam-gain <x>`
 (multi-beam simulation), `--present-mode immediate|mailbox|fifo` (defaults to
 lowest-latency supported), `--fullscreen` (needed for direct scanout), `--no-scan`
-(legacy draw-everything-every-frame mode; `S` toggles live).
+(legacy draw-everything-every-frame mode; `S` toggles live), `--text <message>`
+(the text scene's message; only valid with `--scene text`).
 
 Needs a GPU with any wgpu backend (Vulkan / Metal / DX12 / GL). Debug builds
 work but the beam pass is heavy; prefer `--release`.
@@ -77,7 +79,10 @@ segments, model matrix, and a fixed instance-buffer capacity (`max_segments`).
 The `ship` scene is input-driven (closed-loop steering exists specifically to
 make latency perceptible); `ufo` is a steady scroller for eye-tracked
 motion-clarity comparison; `lissajous` regenerates segments every frame;
-`cube` is rigid. `draw` is the storage scope: `segments()` returns nothing,
+`cube` is rigid. `text` renders a `--text` message through the stroke font in
+`src/font.rs` (glyphs are polylines on a 4x6 grid, laid out in beam path
+order; the `Text(String)` variant owning its message is why `Scene` is not
+`Copy`). `draw` is the storage scope: `segments()` returns nothing,
 `main.rs` builds segments per frame from cursor input (queued on `InputState`,
 drained at render time), only *new* movement is drawn, and the decayed HDR
 buffer is the stroke memory — it always runs in no-scan mode with a 1 s

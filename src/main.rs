@@ -12,6 +12,7 @@
 
 mod bloom;
 mod cli;
+mod font;
 mod geometry;
 mod scan;
 mod screenshot;
@@ -115,7 +116,7 @@ const CAMERA_Z: f32 = 3.0;
 /// (input-driven scenes like the ship). Shared by the live window and the
 /// headless screenshot so both frame the scene identically.
 pub(crate) fn beam_mvp(
-    scene: geometry::Scene,
+    scene: &geometry::Scene,
     aspect: f32,
     time: f32,
     user_model: Option<glam::Mat4>,
@@ -318,7 +319,7 @@ struct GpuState {
 
 impl GpuState {
     async fn new(window: Arc<Window>, opts: &RenderOptions, hw_hz: f32) -> Self {
-        let scene = opts.scene;
+        let scene = opts.scene.clone();
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -613,7 +614,7 @@ impl GpuState {
     /// beam crosshair at the pen. History is not re-drawn — it lives in the
     /// persistent phosphor buffer, like a real storage scope.
     fn drain_draw_segments(&mut self, input: &mut InputState, aspect: f32) -> Vec<geometry::Segment> {
-        let inv_vp = beam_mvp(geometry::Scene::Draw, aspect, 0.0, None).inverse();
+        let inv_vp = beam_mvp(&geometry::Scene::Draw, aspect, 0.0, None).inverse();
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let stroke = [0.35, 1.0, 0.55];
         let crosshair = [0.30, 0.95, 0.95];
@@ -711,7 +712,7 @@ impl GpuState {
             self.ship.integrate(input, dt, aspect);
             self.ship.model()
         });
-        let mvp = beam_mvp(self.scene, aspect, time, user_model);
+        let mvp = beam_mvp(&self.scene, aspect, time, user_model);
 
         // Scan mode compensates for each stroke being lit only 1/N of the
         // scan; the no-scan path with persistence accumulates light across
@@ -1055,13 +1056,15 @@ fn main() {
         // the legacy persistence default; a few seconds in, the cube sits at a
         // pleasant three-quarter angle.
         let persistence = cli.persistence.unwrap_or(DEFAULT_PERSISTENCE);
-        screenshot::capture(&shot.path, shot.width, shot.height, 2.6, persistence, cli.scene);
+        screenshot::capture(&shot.path, shot.width, shot.height, 2.6, persistence, cli.scene.clone());
         println!("wrote {} ({}x{})", shot.path, shot.width, shot.height);
         return;
     }
 
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
+    // Draw-once storage-scope strokes can't survive scan slicing.
+    let scan_enabled = !cli.no_scan && cli.scene != geometry::Scene::Draw;
     let mut app = App {
         opts: RenderOptions {
             persistence: cli.persistence,
@@ -1070,8 +1073,7 @@ fn main() {
             scan_cfg: scan::ScanConfig { scan_hz: cli.scan_hz, beams: cli.beams },
             hw_hz: cli.hw_hz,
             beam_gain: cli.beam_gain,
-            // Draw-once storage-scope strokes can't survive scan slicing.
-            scan_enabled: !cli.no_scan && cli.scene != geometry::Scene::Draw,
+            scan_enabled,
         },
         fullscreen: cli.fullscreen,
         ..App::default()

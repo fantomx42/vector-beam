@@ -80,8 +80,23 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         None => Scene::default(),
         Some(name) => Scene::parse(name)
             .ok_or_else(|| {
-                format!("--scene expects one of: cube, lissajous, ship, ufo, draw (got {name:?})")
+                format!(
+                    "--scene expects one of: cube, lissajous, ship, ufo, draw, text (got {name:?})"
+                )
             })?,
+    };
+
+    let scene = match flag_value(args, "--text") {
+        None => scene,
+        Some(text) => {
+            if text.is_empty() {
+                return Err("--text expects a non-empty string".to_string());
+            }
+            match scene {
+                Scene::Text(_) => Scene::Text(text.to_string()),
+                _ => return Err("--text only applies to --scene text".to_string()),
+            }
+        }
     };
 
     let present_mode = match flag_value(args, "--present-mode") {
@@ -238,6 +253,24 @@ mod tests {
             Scene::Lissajous
         );
         assert!(parse(&args(&["--scene", "teapot"])).is_err());
+    }
+
+    #[test]
+    fn text_scene_and_text_flag() {
+        use crate::geometry::DEFAULT_TEXT;
+        assert_eq!(
+            parse(&args(&["--scene", "text"])).unwrap().scene,
+            Scene::Text(DEFAULT_TEXT.to_string())
+        );
+        assert_eq!(
+            parse(&args(&["--scene", "text", "--text", "HELLO"])).unwrap().scene,
+            Scene::Text("HELLO".to_string())
+        );
+        // --text is meaningless outside the text scene, and empty text draws
+        // nothing; both are user errors.
+        assert!(parse(&args(&["--text", "HELLO"])).is_err());
+        assert!(parse(&args(&["--scene", "cube", "--text", "HELLO"])).is_err());
+        assert!(parse(&args(&["--scene", "text", "--text", ""])).is_err());
     }
 
     #[test]

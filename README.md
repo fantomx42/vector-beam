@@ -83,6 +83,17 @@ cargo run --release -- --scene lissajous
 cargo run --release -- --scene draw
 ```
 
+- `text` — a message drawn in a stroke font ([`src/font.rs`](src/font.rs)):
+  blocky vector-arcade glyphs (A–Z, 0–9, basic punctuation) laid out as beam
+  strokes, swaying gently around Y so the strokes' screen-space lengths
+  breathe under the beam-speed model. `--text "<message>"` sets the message
+  (default `VECTOR BEAM`; a literal newline in the argument makes multi-line
+  text):
+
+```sh
+cargo run --release -- --scene text --text "HELLO WORLD"
+```
+
 ### Regenerate the screenshot
 
 The same renderer can capture a single frame to a PNG headlessly (no window),

@@ -7,6 +7,9 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Default message for the text scene (`--scene text` without `--text`).
+pub const DEFAULT_TEXT: &str = "VECTOR BEAM";
+
 /// Which demo scene to render, parsed from `--scene` on the command line.
 ///
 /// A scene owns both its line segments and its model matrix. The cube is rigid
@@ -14,7 +17,10 @@ use bytemuck::{Pod, Zeroable};
 /// Lissajous curve *morphs* (its phase drifts over time), so its segments are
 /// regenerated every frame and the host must upload them with
 /// `queue.write_buffer` instead of a one-time buffer init.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// Not `Copy`: the text scene owns its message (a scene owns its segments,
+/// and for text the segments are derived from the string).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Scene {
     #[default]
     Cube,
@@ -33,6 +39,9 @@ pub enum Scene {
     /// the opposite of the scan scheduler's redraw-every-cycle contract, so
     /// this scene always runs with scan mode off.
     Draw,
+    /// Stroke-font text (`src/font.rs`) drawn as beam strokes, swaying gently
+    /// around Y. The message comes from `--text` (default [`DEFAULT_TEXT`]).
+    Text(String),
 }
 
 impl Scene {
@@ -43,6 +52,7 @@ impl Scene {
             "ship" => Some(Scene::Ship),
             "ufo" => Some(Scene::Ufo),
             "draw" => Some(Scene::Draw),
+            "text" => Some(Scene::Text(DEFAULT_TEXT.to_string())),
             _ => None,
         }
     }
@@ -55,32 +65,37 @@ impl Scene {
     /// length into per-subframe windows, so segments must be laid out as the
     /// beam would traverse them — consecutive where the stroke is continuous,
     /// with discontinuities ("pen lifts") only where unavoidable.
-    pub fn segments(self, time: f32) -> Vec<Segment> {
+    pub fn segments(&self, time: f32) -> Vec<Segment> {
         match self {
             Scene::Cube => wireframe_cube(0.7),
             Scene::Lissajous => lissajous(600, time),
             Scene::Ship => ship(),
             Scene::Ufo => ufo(),
             Scene::Draw => Vec::new(),
+            Scene::Text(text) => crate::font::layout(text, [0.35, 1.0, 0.55]),
         }
     }
 
     /// Instance-buffer capacity in segments. Fixed per scene so the buffer
     /// never needs to grow; the draw scene's headroom covers a crosshair plus
     /// one frame's worth of cursor movement (history lives in the phosphor).
-    pub fn max_segments(self) -> usize {
+    pub fn max_segments(&self) -> usize {
         match self {
             Scene::Cube => 12,
             Scene::Lissajous => 600,
             Scene::Ship => 5,
             Scene::Ufo => 18,
             Scene::Draw => 256,
+            // Static text: capacity is the exact layout (computed once, at
+            // buffer creation); .max(1) avoids a zero-size buffer for text
+            // with no drawable glyphs.
+            Scene::Text(_) => self.segments(0.0).len().max(1),
         }
     }
 
     /// Whether `segments(time)` changes between frames (=> the instance buffer
     /// must be rewritten per frame).
-    pub fn animated(self) -> bool {
+    pub fn animated(&self) -> bool {
         matches!(self, Scene::Lissajous)
     }
 
@@ -88,7 +103,7 @@ impl Scene {
     /// Lissajous slowly around Y so its depth reads without overpowering the
     /// curve's own morphing. The ship has no autonomous motion — the host
     /// overrides its model matrix from the flight controls.
-    pub fn model(self, time: f32) -> glam::Mat4 {
+    pub fn model(&self, time: f32) -> glam::Mat4 {
         match self {
             Scene::Cube => {
                 glam::Mat4::from_rotation_y(time * 0.7) * glam::Mat4::from_rotation_x(time * 0.4)
@@ -107,6 +122,9 @@ impl Scene {
                     0.0,
                 ))
             }
+            // A gentle Y sway: the text stays readable while its strokes'
+            // screen-space lengths breathe, exercising the beam-speed model.
+            Scene::Text(_) => glam::Mat4::from_rotation_y((time * 0.4).sin() * 0.35),
         }
     }
 }
