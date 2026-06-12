@@ -33,12 +33,11 @@ lowest-latency supported), `--fullscreen` (needed for direct scanout), `--no-sca
 Needs a GPU with any wgpu backend (Vulkan / Metal / DX12 / GL). Debug builds
 work but the beam pass is heavy; prefer `--release`.
 
-## Branch state (as of 2026-06-12)
+## Branch state
 
-The v0.2.3 draw scene has been ported onto the scan architecture on `main`;
-branch `draw-scene` is the historical pre-port implementation and can be
-deleted. The draw scene always forces scan mode off (draw-once storage-scope
-strokes can't survive scan slicing — see the `Scene::Draw` doc comment).
+Everything lives on `main`. The draw scene always forces scan mode off
+(draw-once storage-scope strokes can't survive scan slicing — see the
+`Scene::Draw` doc comment).
 
 ## Architecture
 
