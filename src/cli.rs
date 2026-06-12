@@ -79,7 +79,9 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let scene = match flag_value(args, "--scene") {
         None => Scene::default(),
         Some(name) => Scene::parse(name)
-            .ok_or_else(|| format!("--scene expects one of: cube, lissajous, ship (got {name:?})"))?,
+            .ok_or_else(|| {
+                format!("--scene expects one of: cube, lissajous, ship, ufo (got {name:?})")
+            })?,
     };
 
     let present_mode = match flag_value(args, "--present-mode") {

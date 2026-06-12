@@ -126,6 +126,12 @@ impl ScanScheduler {
             .collect();
     }
 
+    /// Forget scan progress; called when scan mode is toggled at runtime so
+    /// re-enabling doesn't "catch up" over the windows spent in full-redraw.
+    pub fn reset(&mut self) {
+        self.last_window = None;
+    }
+
     /// Absolute subframe window index at `elapsed` seconds.
     fn window(&self, elapsed: f32) -> u64 {
         (elapsed.max(0.0) as f64 * self.scan_hz as f64 * self.n as f64) as u64

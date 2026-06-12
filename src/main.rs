@@ -15,6 +15,7 @@ mod cli;
 mod geometry;
 mod scan;
 mod screenshot;
+mod telemetry;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -132,6 +133,9 @@ struct InputState {
     turn_left: bool,
     turn_right: bool,
     thrust: bool,
+    /// Timestamp of the most recent input edge (key press/release), consumed
+    /// by the latency probe after the frame folding it in is submitted.
+    last_event: Option<Instant>,
 }
 
 /// Asteroids-style ship kinematics: turn and thrust with momentum, no drag,
@@ -268,6 +272,11 @@ struct GpuState {
     beam_gain: f32,
     scratch_ranges: Vec<std::ops::Range<u32>>,
 
+    // Verification instrumentation: input-to-submit latency percentiles and
+    // GPU frame time via timestamp queries (None when unsupported).
+    hist: telemetry::LatencyHistogram,
+    timer: Option<telemetry::GpuTimer>,
+
     uniform_buffer: wgpu::Buffer,
     beam_bind_group: wgpu::BindGroup,
 
@@ -307,7 +316,9 @@ impl GpuState {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),
-                required_features: wgpu::Features::empty(),
+                // Timestamp queries only where the adapter has them; the GPU
+                // timer degrades to None otherwise (telemetry.rs).
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -504,6 +515,11 @@ impl GpuState {
             bloom.output_view(),
         );
 
+        let timer = telemetry::GpuTimer::new(&device, &queue);
+        if timer.is_none() {
+            eprintln!("timestamp queries unsupported; GPU frame time will not be reported");
+        }
+
         Self {
             surface,
             device,
@@ -520,6 +536,8 @@ impl GpuState {
             scan_enabled: opts.scan_enabled,
             beam_gain,
             scratch_ranges: Vec::new(),
+            hist: telemetry::LatencyHistogram::new(),
+            timer,
             uniform_buffer,
             beam_bind_group,
             instance_buffer,
@@ -551,7 +569,7 @@ impl GpuState {
         );
     }
 
-    fn render(&mut self, start: Instant, input: &InputState) {
+    fn render(&mut self, start: Instant, input: &mut InputState) {
         // Acquire the swapchain frame FIRST: under Fifo this is where the loop
         // blocks for vsync, so everything sampled after it (timing, animation
         // state, uniforms) is as fresh as possible when the frame is submitted.
@@ -641,7 +659,8 @@ impl GpuState {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                // GPU frame time runs from the start of this (first) pass...
+                timestamp_writes: self.timer.as_ref().map(|t| t.begin_writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -687,7 +706,8 @@ impl GpuState {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                // ...to the end of this (last) pass.
+                timestamp_writes: self.timer.as_ref().map(|t| t.end_writes()),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -696,8 +716,26 @@ impl GpuState {
             pass.draw(0..3, 0..1);
         }
 
+        // Resolve this frame's timestamps into a free staging slot, if any.
+        let timer_slot = self
+            .timer
+            .as_mut()
+            .and_then(|t| t.resolve_and_read(&mut encoder));
+
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+
+        if let (Some(timer), Some(slot)) = (self.timer.as_mut(), timer_slot) {
+            timer.map_slot(slot);
+        }
+        // Input-to-submit latency: stamped at the input event, measured now
+        // that the frame folding it in has been submitted. Scanout (which the
+        // CPU can't observe) adds at most one refresh on top.
+        if let Some(t0) = input.last_event.take() {
+            self.hist.record(t0.elapsed().as_secs_f32());
+        }
+        let gpu_ms = self.timer.as_mut().and_then(|t| t.poll_ms(&self.device));
+        self.hist.maybe_report(gpu_ms);
     }
 }
 
@@ -836,22 +874,41 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = event.state.is_pressed();
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::ArrowLeft | KeyCode::KeyA) => {
-                        self.input.turn_left = pressed;
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                match code {
+                    KeyCode::ArrowLeft | KeyCode::KeyA => self.input.turn_left = pressed,
+                    KeyCode::ArrowRight | KeyCode::KeyD => self.input.turn_right = pressed,
+                    KeyCode::ArrowUp | KeyCode::KeyW => self.input.thrust = pressed,
+                    // Motion-clarity A/B switch: toggle scan mode live (the
+                    // persistence default follows the mode).
+                    KeyCode::KeyS if pressed && !event.repeat => {
+                        gpu.scan_enabled = !gpu.scan_enabled;
+                        gpu.scan.reset();
+                        let tau = gpu.persistence_override.unwrap_or(if gpu.scan_enabled {
+                            DEFAULT_PERSISTENCE_SCAN
+                        } else {
+                            DEFAULT_PERSISTENCE
+                        });
+                        eprintln!(
+                            "scan mode: {} (persistence {:.1} ms)",
+                            if gpu.scan_enabled { "on" } else { "off" },
+                            tau * 1e3,
+                        );
+                        return;
                     }
-                    PhysicalKey::Code(KeyCode::ArrowRight | KeyCode::KeyD) => {
-                        self.input.turn_right = pressed;
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::KeyW) => {
-                        self.input.thrust = pressed;
-                    }
-                    _ => {}
+                    _ => return,
+                }
+                // Latency probe: only edges count; key repeats aren't fresh
+                // user input.
+                if !event.repeat {
+                    self.input.last_event = Some(Instant::now());
                 }
             }
             WindowEvent::RedrawRequested => {
                 let start = self.start.unwrap_or_else(Instant::now);
-                gpu.render(start, &self.input);
+                gpu.render(start, &mut self.input);
             }
             _ => {}
         }

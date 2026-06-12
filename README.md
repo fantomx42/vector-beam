@@ -18,13 +18,51 @@ leaving fading phosphor trails as it turns.
 Needs a GPU with a Vulkan / Metal / DX12 / GL backend (anything wgpu supports).
 
 The trail length is tunable with `--persistence <seconds>` (the phosphor decay
-time constant, default `0.1`); `--persistence 0` disables trails entirely.
+time constant); `--persistence 0` disables trails entirely. The default depends
+on the mode: 3 ms in scan mode (below), 100 ms with `--no-scan`.
+
+### Beam scan mode
+
+By default the renderer behaves like an actual vector display rather than a
+framebuffer: the hardware loop presents at the panel rate (say 240 Hz) while
+the scene refreshes at a logical *scan rate* (60 Hz default), and each hardware
+frame draws only the slice of the stroke list the beam would have covered in
+that ~4 ms window. Stroke list order is the beam path order; the scheduler
+([`src/scan.rs`](src/scan.rs)) slices it by cumulative arc length, and phosphor
+decay fills the time between slices. On a high-refresh panel this gives
+CRT-like motion clarity and an unusually short input-to-photon path.
+
+- `--scan-hz <hz>` — logical scan rate (default 60; 120 halves the flicker at
+  the cost of half the clarity benefit).
+- `--hw-hz <hz>` — override the detected monitor refresh rate.
+- `--beams <B>` — simulate B simultaneous beams: the stroke list is split into
+  B arcs and each subframe draws one bucket from every arc.
+- `--beam-gain <x>` — brightness compensation; each stroke is lit only 1/N of
+  the scan cycle, so intensity defaults to N× (capped at 16).
+- `--no-scan` — start in the legacy draw-everything-every-frame mode. The
+  `S` key toggles scan mode live (the persistence default follows the mode).
+- `--present-mode immediate|mailbox|fifo` — swapchain present mode; by default
+  the lowest-latency supported mode is chosen (Immediate → Mailbox → Fifo).
+- `--fullscreen` — borderless fullscreen, required for direct scanout; a
+  window always eats a compositor copy.
+
+The frame loop holds at most one frame of queued latency, and a 5-second
+telemetry line reports input-to-submit percentiles plus GPU frame time (via
+timestamp queries, where supported). For a clean scan cadence, disable
+adaptive sync (VRR) on the panel — re-timed scanout jitters the subframe
+windows.
 
 ### Scenes
 
 `--scene <name>` picks the demo scene:
 
 - `cube` (default) — the tumbling wireframe cube above.
+- `ship` — an Asteroids-style ship: arrows or WASD to turn and thrust, momentum
+  and screen wrap included. Closed-loop steering is the canonical way to *feel*
+  the latency work, which a self-animating scene can't show.
+- `ufo` — a saucer scrolling steadily across the screen (a UFO-test-style
+  motion-clarity pattern): track it with your eyes and toggle scan mode with
+  `S`; the difference in edge clarity is unambiguous.
 - `lissajous` — a dense 3D Lissajous curve whose phase drifts over time, so the
   figure continuously morphs like a slowly de-tuning oscilloscope:
 

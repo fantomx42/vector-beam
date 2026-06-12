@@ -23,6 +23,10 @@ pub enum Scene {
     /// canonical input-latency feel test. The glyph is static; all motion
     /// lives in a host-supplied model matrix driven by the flight keys.
     Ship,
+    /// A saucer glyph scrolling steadily across the screen (UFO-test-style
+    /// motion-clarity pattern): track it with your eyes and toggle scan mode
+    /// with S — the difference in edge clarity is the verification.
+    Ufo,
 }
 
 impl Scene {
@@ -31,6 +35,7 @@ impl Scene {
             "cube" => Some(Scene::Cube),
             "lissajous" => Some(Scene::Lissajous),
             "ship" => Some(Scene::Ship),
+            "ufo" => Some(Scene::Ufo),
             _ => None,
         }
     }
@@ -48,6 +53,7 @@ impl Scene {
             Scene::Cube => wireframe_cube(0.7),
             Scene::Lissajous => lissajous(600, time),
             Scene::Ship => ship(),
+            Scene::Ufo => ufo(),
         }
     }
 
@@ -68,6 +74,16 @@ impl Scene {
             }
             Scene::Lissajous => glam::Mat4::from_rotation_y(time * 0.25),
             Scene::Ship => glam::Mat4::IDENTITY,
+            // Constant-velocity horizontal scroll, wrapping at +-2 world
+            // units. Steady speed matters: the eye must be able to smoothly
+            // pursue the glyph for the motion-clarity comparison to read.
+            Scene::Ufo => {
+                glam::Mat4::from_translation(glam::Vec3::new(
+                    (time * 1.2).rem_euclid(4.0) - 2.0,
+                    0.0,
+                    0.0,
+                ))
+            }
         }
     }
 }
@@ -145,6 +161,30 @@ pub fn ship() -> Vec<Segment> {
     path.windows(2)
         .map(|w| Segment::new(w[0], w[1], green))
         .collect()
+}
+
+/// A flying-saucer glyph at z = 0 in beam path order: a 12-segment hull
+/// ellipse loop, then (one pen lift) a 6-segment dome arc on top.
+pub fn ufo() -> Vec<Segment> {
+    use std::f32::consts::{PI, TAU};
+    let green = [0.35, 1.0, 0.55];
+    let mut segs = Vec::with_capacity(18);
+
+    // Hull: full ellipse, rx 0.35 / ry 0.10.
+    let hull = |t: f32| [0.35 * t.cos(), 0.10 * t.sin(), 0.0];
+    for i in 0..12 {
+        let t0 = TAU * i as f32 / 12.0;
+        let t1 = TAU * (i + 1) as f32 / 12.0;
+        segs.push(Segment::new(hull(t0), hull(t1), green));
+    }
+    // Dome: upper half-ellipse, rx 0.16 / ry 0.12, sitting on the hull.
+    let dome = |t: f32| [0.16 * t.cos(), 0.06 + 0.12 * t.sin(), 0.0];
+    for i in 0..6 {
+        let t0 = PI * i as f32 / 6.0;
+        let t1 = PI * (i + 1) as f32 / 6.0;
+        segs.push(Segment::new(dome(t0), dome(t1), green));
+    }
+    segs
 }
 
 /// A 3D Lissajous curve sampled into `n` connected segments — an "oscilloscope"
