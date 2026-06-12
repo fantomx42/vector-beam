@@ -32,6 +32,12 @@ impl Scene {
 
     /// The scene's line segments at `time`. Both scenes emit a fixed segment
     /// count, so the instance buffer never needs to grow.
+    ///
+    /// Draw-order contract: the order of this list IS the beam path order.
+    /// The scan scheduler (`scan.rs`) slices the list by cumulative arc
+    /// length into per-subframe windows, so segments must be laid out as the
+    /// beam would traverse them — consecutive where the stroke is continuous,
+    /// with discontinuities ("pen lifts") only where unavoidable.
     pub fn segments(self, time: f32) -> Vec<Segment> {
         match self {
             Scene::Cube => wireframe_cube(0.7),
@@ -89,11 +95,15 @@ pub fn wireframe_cube(s: f32) -> Vec<Segment> {
         [s, s, s],    // 6
         [-s, s, s],   // 7
     ];
-    // Edge list as corner-index pairs.
+    // Edge list as corner-index pairs, in beam path order (see the draw-order
+    // contract on `Scene::segments`). No Eulerian path exists — every corner
+    // has odd degree 3 — so the traversal is one continuous 9-edge stroke
+    // followed by three pen-lift strokes for the remaining connectors.
     let edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0), // back face
-        (4, 5), (5, 6), (6, 7), (7, 4), // front face
-        (0, 4), (1, 5), (2, 6), (3, 7), // connecting edges
+        (0, 1), (1, 2), (2, 3), (3, 0), // back face loop
+        (0, 4),                          // drop to the front face
+        (4, 5), (5, 6), (6, 7), (7, 4), // front face loop
+        (1, 5), (2, 6), (3, 7),          // remaining connectors (pen lifts)
     ];
 
     // Phosphor green, with a faint cyan tint on the depth-connecting edges so
@@ -103,9 +113,9 @@ pub fn wireframe_cube(s: f32) -> Vec<Segment> {
 
     edges
         .iter()
-        .enumerate()
-        .map(|(i, &(a, b))| {
-            let color = if i >= 8 { cyan } else { green };
+        .map(|&(a, b)| {
+            // The four z-connectors pair corner i with corner i+4.
+            let color = if b == a + 4 { cyan } else { green };
             Segment::new(v[a], v[b], color)
         })
         .collect()

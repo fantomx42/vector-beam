@@ -2,12 +2,18 @@
 //!
 //! Pipeline: decay pass (fade the persistent HDR target -> phosphor trails) ->
 //! beam pass (instanced line segments, additive blend into the same Rgba16Float
-//! HDR target) -> tonemap pass (Reinhard, resolve to the sRGB swapchain). The
-//! only animated input is the MVP matrix, updated per frame.
+//! HDR target) -> tonemap pass (Reinhard, resolve to the sRGB swapchain).
+//!
+//! The hardware loop presents at the panel rate while the scene refreshes at a
+//! logical scan rate (60 Hz default): each hardware frame draws only the slice
+//! of the stroke list the beam would have covered in that subframe window
+//! (`scan.rs`), and the decay pass fills the time between slices. `--no-scan`
+//! restores the draw-everything-every-frame behavior.
 
 mod bloom;
 mod cli;
 mod geometry;
+mod scan;
 mod screenshot;
 
 use std::sync::Arc;
@@ -38,10 +44,17 @@ pub(crate) const SEGMENT_ATTRS: [wgpu::VertexAttribute; 3] =
 
 pub(crate) const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Default phosphor persistence time constant (seconds). The HDR target fades
-/// by `exp(-dt / persistence)` each frame, so strokes are ~5% bright after
-/// 3 time constants. 0 disables persistence (every frame starts black).
+/// Default phosphor persistence time constant (seconds) when scan mode is off.
+/// The HDR target fades by `exp(-dt / persistence)` each frame, so strokes are
+/// ~5% bright after 3 time constants. 0 disables persistence (every frame
+/// starts black).
 pub(crate) const DEFAULT_PERSISTENCE: f32 = 0.1;
+
+/// Default persistence in scan mode: the fast-phosphor regime. Each stroke is
+/// lit for only one subframe per scan, and a long tail (100 ms spans ~24
+/// hardware frames at 240 Hz) would smear away exactly the motion clarity the
+/// scan buys; 3 ms keeps a stroke visible across roughly one scan period.
+pub(crate) const DEFAULT_PERSISTENCE_SCAN: f32 = 0.003;
 
 /// Build the render pipeline for `shaders/decay.wgsl`: a fullscreen triangle
 /// whose only effect is the fixed-function blend `dst * blend_constant`, fading
@@ -101,12 +114,31 @@ pub(crate) fn beam_mvp(scene: geometry::Scene, aspect: f32, time: f32) -> glam::
 
 /// Everything the live window needs to construct a `GpuState`, gathered from
 /// the CLI before the event loop starts.
-#[derive(Default)]
 struct RenderOptions {
-    /// `None` = use the default persistence time constant.
+    /// `None` = use the mode-dependent default persistence time constant.
     persistence: Option<f32>,
     scene: geometry::Scene,
     present_mode: Option<cli::PresentModeArg>,
+    scan_cfg: scan::ScanConfig,
+    /// `--hw-hz` override; otherwise the monitor refresh rate is used.
+    hw_hz: Option<f32>,
+    /// `None` = default gain of N (subframes per scan), capped at 16.
+    beam_gain: Option<f32>,
+    scan_enabled: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            persistence: None,
+            scene: geometry::Scene::default(),
+            present_mode: None,
+            scan_cfg: scan::ScanConfig::default(),
+            hw_hz: None,
+            beam_gain: None,
+            scan_enabled: true,
+        }
+    }
 }
 
 /// Pick the swapchain present mode: honor an explicit `--present-mode` when
@@ -143,12 +175,22 @@ struct GpuState {
     beam_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
 
-    // Phosphor persistence time constant (seconds); 0 disables. `last_frame`
-    // feeds the framerate-independent decay factor exp(-dt / persistence).
-    persistence: f32,
+    // Phosphor persistence time constant (seconds); `None` = mode-dependent
+    // default (DEFAULT_PERSISTENCE_SCAN when scanning, DEFAULT_PERSISTENCE
+    // otherwise), 0 disables. `last_frame` feeds the framerate-independent
+    // decay factor exp(-dt / persistence).
+    persistence_override: Option<f32>,
     last_frame: Instant,
 
     scene: geometry::Scene,
+
+    // Scan scheduler state: which slice of the stroke list each hardware
+    // frame draws. `scan_enabled` is runtime-toggleable; `beam_gain`
+    // compensates brightness for strokes being lit only 1/N of the scan.
+    scan: scan::ScanScheduler,
+    scan_enabled: bool,
+    beam_gain: f32,
+    scratch_ranges: Vec<std::ops::Range<u32>>,
 
     uniform_buffer: wgpu::Buffer,
     beam_bind_group: wgpu::BindGroup,
@@ -167,8 +209,7 @@ struct GpuState {
 }
 
 impl GpuState {
-    async fn new(window: Arc<Window>, opts: &RenderOptions) -> Self {
-        let persistence = opts.persistence.unwrap_or(DEFAULT_PERSISTENCE);
+    async fn new(window: Arc<Window>, opts: &RenderOptions, hw_hz: f32) -> Self {
         let scene = opts.scene;
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
@@ -237,6 +278,21 @@ impl GpuState {
             contents: bytemuck::cast_slice(&segments),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+
+        // --- Scan scheduler ---
+        // Each stroke is lit 1/N of the scan cycle, so intensity is multiplied
+        // by ~N to integrate to equal perceived brightness. The default is
+        // capped: past ~16x the HDR accumulation mostly feeds the tonemapper's
+        // shoulder (the software analogue of ABL capping a real CRT).
+        let scan = scan::ScanScheduler::new(&segments, opts.scan_cfg, hw_hz);
+        let beam_gain = opts.beam_gain.unwrap_or((scan.n as f32).min(16.0));
+        eprintln!(
+            "scan: {} (hw {hw_hz} Hz / scan {} Hz -> {} subframes, {} beam(s), gain {beam_gain:.1}x)",
+            if opts.scan_enabled { "on" } else { "off" },
+            scan.scan_hz,
+            scan.n,
+            scan.beams,
+        );
 
         // --- Uniforms ---
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -380,9 +436,13 @@ impl GpuState {
             decay_pipeline,
             beam_pipeline,
             tonemap_pipeline,
-            persistence,
+            persistence_override: opts.persistence,
             last_frame: Instant::now(),
             scene,
+            scan,
+            scan_enabled: opts.scan_enabled,
+            beam_gain,
+            scratch_ranges: Vec::new(),
             uniform_buffer,
             beam_bind_group,
             instance_buffer,
@@ -439,22 +499,31 @@ impl GpuState {
 
         // Framerate-independent phosphor fade for this frame. With persistence
         // disabled the factor is 0, which multiplies the old frame away entirely
-        // (equivalent to the pre-persistence clear).
+        // (equivalent to the pre-persistence clear). The default time constant
+        // depends on the mode: scan mode needs a fast phosphor or the slices
+        // smear back together.
+        let persistence = self.persistence_override.unwrap_or(if self.scan_enabled {
+            DEFAULT_PERSISTENCE_SCAN
+        } else {
+            DEFAULT_PERSISTENCE
+        });
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-        let decay = if self.persistence > 0.0 {
-            (-dt / self.persistence).exp() as f64
+        let decay = if persistence > 0.0 {
+            (-dt / persistence).exp() as f64
         } else {
             0.0
         };
 
         // Animate: the scene's model matrix always moves; a morphing scene
-        // (Lissajous) additionally regenerates its segments each frame.
+        // (Lissajous) additionally regenerates its segments each frame, and the
+        // scan buckets must track the regenerated arc lengths.
         if self.scene.animated() {
             let segments = self.scene.segments(time);
             self.queue
                 .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&segments));
+            self.scan.rebuild(&segments);
         }
         let aspect = self.config.width as f32 / self.config.height as f32;
         let mvp = beam_mvp(self.scene, aspect, time);
@@ -463,7 +532,7 @@ impl GpuState {
             mvp: mvp.to_cols_array(),
             resolution: [self.config.width as f32, self.config.height as f32],
             base_width: 6.0,
-            brightness: 1.0,
+            brightness: if self.scan_enabled { self.beam_gain } else { 1.0 },
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -504,7 +573,17 @@ impl GpuState {
             pass.set_pipeline(&self.beam_pipeline);
             pass.set_bind_group(0, &self.beam_bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            pass.draw(0..6, 0..self.instance_count);
+            if self.scan_enabled {
+                // Draw only the slice(s) of the stroke list the beam covers in
+                // this subframe window; segments are contiguous in the
+                // instance buffer, so a subframe is just an instance range.
+                self.scan.ranges(time, &mut self.scratch_ranges);
+                for r in self.scratch_ranges.drain(..) {
+                    pass.draw(0..6, r);
+                }
+            } else {
+                pass.draw(0..6, 0..self.instance_count);
+            }
         }
 
         // Pass 2: bloom chain (bright-pass downsample + separable blur).
@@ -638,7 +717,20 @@ impl ApplicationHandler for App {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = pollster::block_on(GpuState::new(window.clone(), &self.opts));
+        // Hardware refresh rate: explicit --hw-hz wins, then the monitor's
+        // reported rate, then 60 as a conservative fallback. Note: a VRR panel
+        // re-times scanout and jitters the scan cadence — run fixed-rate.
+        let hw_hz = self.opts.hw_hz.unwrap_or_else(|| {
+            window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| mhz as f32 / 1000.0)
+                .unwrap_or_else(|| {
+                    eprintln!("monitor refresh rate unknown; assuming 60 Hz (use --hw-hz)");
+                    60.0
+                })
+        });
+        let gpu = pollster::block_on(GpuState::new(window.clone(), &self.opts, hw_hz));
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.start = Some(Instant::now());
@@ -700,6 +792,10 @@ fn main() {
             persistence: cli.persistence,
             scene: cli.scene,
             present_mode: cli.present_mode,
+            scan_cfg: scan::ScanConfig { scan_hz: cli.scan_hz, beams: 1 },
+            hw_hz: cli.hw_hz,
+            beam_gain: cli.beam_gain,
+            scan_enabled: !cli.no_scan,
         },
         fullscreen: cli.fullscreen,
         ..App::default()

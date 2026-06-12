@@ -51,6 +51,14 @@ pub struct Cli {
     pub screenshot: Option<Screenshot>,
     pub present_mode: Option<PresentModeArg>,
     pub fullscreen: bool,
+    /// Logical scene refresh rate (`--scan-hz`, default 60).
+    pub scan_hz: f32,
+    /// Hardware refresh override (`--hw-hz`); `None` = detect from monitor.
+    pub hw_hz: Option<f32>,
+    /// Scan-mode brightness multiplier (`--beam-gain`); `None` = N, capped.
+    pub beam_gain: Option<f32>,
+    /// Start with scan mode off (`--no-scan`).
+    pub no_scan: bool,
 }
 
 /// Parse `args` (including `argv[0]`). Errors are user-facing messages for
@@ -101,12 +109,51 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         }
     });
 
+    let scan_hz = match flag_value(args, "--scan-hz") {
+        None => 60.0,
+        Some(v) => {
+            let hz: f32 = v
+                .parse()
+                .map_err(|_| format!("--scan-hz expects a rate in Hz (got {v:?})"))?;
+            if hz <= 0.0 {
+                return Err(format!("--scan-hz must be positive (got {hz})"));
+            }
+            hz
+        }
+    };
+
+    let hw_hz = match flag_value(args, "--hw-hz") {
+        None => None,
+        Some(v) => {
+            let hz: f32 = v
+                .parse()
+                .map_err(|_| format!("--hw-hz expects a rate in Hz (got {v:?})"))?;
+            if hz <= 0.0 {
+                return Err(format!("--hw-hz must be positive (got {hz})"));
+            }
+            Some(hz)
+        }
+    };
+
+    let beam_gain = match flag_value(args, "--beam-gain") {
+        None => None,
+        Some(v) => Some(
+            v.parse::<f32>()
+                .map_err(|_| format!("--beam-gain expects a multiplier (got {v:?})"))?
+                .max(0.0),
+        ),
+    };
+
     Ok(Cli {
         persistence,
         scene,
         screenshot,
         present_mode,
         fullscreen: flag_present(args, "--fullscreen"),
+        scan_hz,
+        hw_hz,
+        beam_gain,
+        no_scan: flag_present(args, "--no-scan"),
     })
 }
 
@@ -206,5 +253,27 @@ mod tests {
     fn fullscreen_flag() {
         assert!(!parse(&args(&[])).unwrap().fullscreen);
         assert!(parse(&args(&["--fullscreen"])).unwrap().fullscreen);
+    }
+
+    #[test]
+    fn scan_flags() {
+        let cli = parse(&args(&[])).unwrap();
+        assert_eq!(cli.scan_hz, 60.0);
+        assert_eq!(cli.hw_hz, None);
+        assert_eq!(cli.beam_gain, None);
+        assert!(!cli.no_scan);
+
+        let cli = parse(&args(&[
+            "--scan-hz", "120", "--hw-hz", "240", "--beam-gain", "2.5", "--no-scan",
+        ]))
+        .unwrap();
+        assert_eq!(cli.scan_hz, 120.0);
+        assert_eq!(cli.hw_hz, Some(240.0));
+        assert_eq!(cli.beam_gain, Some(2.5));
+        assert!(cli.no_scan);
+
+        assert!(parse(&args(&["--scan-hz", "0"])).is_err());
+        assert!(parse(&args(&["--hw-hz", "-60"])).is_err());
+        assert!(parse(&args(&["--beam-gain", "lots"])).is_err());
     }
 }
